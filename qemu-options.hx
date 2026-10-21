@@ -3516,6 +3516,14 @@ SRST
 
             |qemu_system| -nic user,guestfwd=tcp:10.0.2.100:3128-unix-connect:/tmp/proxy.sock
 
+    ``guestfwd=[tcp]:server:port-fdpass:fd``
+        For each guest TCP connection to the IP address server on port
+        port, pass one end of a new socket pair over the Unix stream
+        socket fd (SCM_RIGHTS, with one byte) and connect the guest
+        connection to the other: the program that handed QEMU fd serves
+        each connection from its end of fd, with no path for another
+        process to connect to or to bind first.
+
 ``-netdev tap,id=id[,fd=h][,ifname=name][,script=file][,downscript=dfile][,br=bridge][,helper=helper]``
     Configure a host TAP network backend with ID id.
 

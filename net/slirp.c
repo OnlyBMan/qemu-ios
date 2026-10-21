@@ -1339,6 +1339,67 @@ static ssize_t guestfwd_write(const void *buf, size_t len, void *chr)
     return qemu_chr_fe_write_all(chr, buf, len);
 }
 
+#ifndef WIN32
+/*
+ * guestfwd's fdpass:FD: one end of a new socket pair for each guest
+ * connection, passed (SCM_RIGHTS, with one byte) over the Unix stream socket
+ * FD to whoever holds its peer; slirp gets the other end. The host's server
+ * takes each connection off a socket it handed QEMU, so there is no path
+ * that another process could connect to or bind in its place.
+ */
+static int guestfwd_fdpass_connect(void *opaque)
+{
+    int via = (int)(intptr_t)opaque;
+    int pair[2];
+    char byte = 'C';
+    struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
+    union {
+        struct cmsghdr header;
+        char space[CMSG_SPACE(sizeof(int))];
+    } control;
+    struct msghdr msg = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control.space, .msg_controllen = sizeof(control.space),
+    };
+    struct cmsghdr *c;
+    ssize_t n;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0) {
+        return -1;
+    }
+    memset(&control, 0, sizeof(control));
+    c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &pair[1], sizeof(int));
+    do {
+        n = sendmsg(via, &msg, 0);
+    } while (n < 0 && errno == EINTR);
+    close(pair[1]);
+    if (n != 1) {
+        close(pair[0]);
+        return -1;
+    }
+    fcntl(pair[0], F_SETFD, FD_CLOEXEC);
+    return pair[0];
+}
+
+/* FD is a Unix stream socket: guestfwd's fdpass: passes connections over it. */
+static bool guestfwd_fdpass_socket(int fd)
+{
+    int type = 0;
+    socklen_t size = sizeof(type);
+    struct sockaddr_storage address;
+    socklen_t length = sizeof(address);
+
+    return fd >= 0 && getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) == 0 &&
+           type == SOCK_STREAM &&
+           getsockname(fd, (struct sockaddr *)&address, &length) == 0 &&
+           address.ss_family == AF_UNIX;
+}
+#endif
+
 static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp)
 {
     /* TODO: IPv6 */
@@ -1390,6 +1451,24 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp)
             return -1;
         }
         if (slirp_add_unix(s->slirp, path, &server, port) < 0) {
+            error_setg(errp, "Conflicting/invalid host:port in guest "
+                       "forwarding rule '%s'", config_str);
+            return -1;
+        }
+#endif
+#ifndef WIN32
+    } else if (g_str_has_prefix(p, "fdpass:")) {
+        long via = strtol(p + strlen("fdpass:"), &end, 10);
+
+        if (*end != '\0' || via < 0 || via > INT_MAX ||
+            !guestfwd_fdpass_socket(via)) {
+            error_setg(errp, "fdpass: needs a Unix stream socket's descriptor "
+                       "in guest forwarding rule '%s'", config_str);
+            return -1;
+        }
+        if (slirp_add_guestfwd_connector(s->slirp, guestfwd_fdpass_connect,
+                                         (void *)(intptr_t)via, &server,
+                                         port) < 0) {
             error_setg(errp, "Conflicting/invalid host:port in guest "
                        "forwarding rule '%s'", config_str);
             return -1;

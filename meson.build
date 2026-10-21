@@ -1326,12 +1326,15 @@ if not get_option('slirp').auto() or have_system
   # qemu_ios_ui_net_lan refuse local-network destinations with slirp_set_local_network()
   # (the guest's DNS through net/slirp-dns.c on macOS, slirp_set_dns_forward()), and no
   # destination on the host itself is reachable (slirp_destination_class()), all from
-  # subprojects/packagefiles/libslirp-set-restricted.patch. A libslirp built with the
-  # patch (the app's static native root) is used as found; one without it (Homebrew's, or
-  # one from an older patch) gives way to the patched subproject, static so the binaries
-  # gain no runtime dylib.
-  if slirp.found() and not cc.has_function('slirp_destination_class', dependencies: slirp,
-                                           prefix: '#include <libslirp.h>')
+  # subprojects/packagefiles/libslirp-set-restricted.patch; guestfwd's fdpass: forwards with
+  # slirp_add_guestfwd_connector() from libslirp-guestfwd-connector.patch. A libslirp built
+  # with both patches (the app's static native root) is used as found; one without them
+  # (Homebrew's, or one from older patches) gives way to the patched subproject, static so
+  # the binaries gain no runtime dylib.
+  if slirp.found() and not (cc.has_function('slirp_destination_class', dependencies: slirp,
+                                            prefix: '#include <libslirp.h>') and
+                            cc.has_function('slirp_add_guestfwd_connector', dependencies: slirp,
+                                            prefix: '#include <libslirp.h>'))
     slirp = subproject('slirp', default_options: ['default_library=static']).get_variable('libslirp_libdep')
   endif
 endif

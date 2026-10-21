@@ -1,0 +1,144 @@
+diff --git a/src/libslirp.h b/src/libslirp.h
+index 4607168..0033840 100644
+--- a/src/libslirp.h
++++ b/src/libslirp.h
+@@ -390,6 +390,19 @@ SLIRP_EXPORT
+ int slirp_add_guestfwd(Slirp *slirp, SlirpWriteCb write_cb, void *opaque,
+                        struct in_addr *guest_addr, int guest_port);
+ 
++/* Called for each connection the guest opens to a forward added with
++ * slirp_add_guestfwd_connector: a connected stream socket for it, which slirp
++ * owns from then on, or a negative value to refuse the connection. */
++typedef int (*SlirpConnectCb)(void *opaque);
++
++/* Set up port forwarding between a port in the guest network and a socket
++ * the application connects for each guest connection (as slirp_add_unix does
++ * by path, without the path) */
++SLIRP_EXPORT
++int slirp_add_guestfwd_connector(Slirp *slirp, SlirpConnectCb connect_cb,
++                                 void *opaque, struct in_addr *guest_addr,
++                                 int guest_port);
++
+ /* TODO: rather identify a guestfwd through an opaque pointer instead of through
+  * the guest_addr */
+ 
+@@ -404,7 +417,8 @@ SLIRP_EXPORT
+ void slirp_socket_recv(Slirp *slirp, struct in_addr guest_addr, int guest_port,
+                        const uint8_t *buf, int size);
+ 
+-/* Remove entries added by slirp_add_exec, slirp_add_unix or slirp_add_guestfwd */
++/* Remove entries added by slirp_add_exec, slirp_add_unix, slirp_add_guestfwd
++ * or slirp_add_guestfwd_connector */
+ SLIRP_EXPORT
+ int slirp_remove_guestfwd(Slirp *slirp, struct in_addr guest_addr,
+                           int guest_port);
+diff --git a/src/misc.c b/src/misc.c
+index e5e2164..4fa8850 100644
+--- a/src/misc.c
++++ b/src/misc.c
+@@ -63,6 +63,17 @@ struct gfwd_list *add_unix(struct gfwd_list **ex_ptr, const char *unixsock,
+     return f;
+ }
+ 
++struct gfwd_list *add_connector(struct gfwd_list **ex_ptr,
++                                SlirpConnectCb connect_cb, void *opaque,
++                                struct in_addr addr, int port)
++{
++    struct gfwd_list *f = add_guestfwd(ex_ptr, NULL, opaque, addr, port);
++
++    f->connect_cb = connect_cb;
++
++    return f;
++}
++
+ int remove_guestfwd(struct gfwd_list **ex_ptr, struct in_addr addr, int port)
+ {
+     for (; *ex_ptr != NULL; ex_ptr = &((*ex_ptr)->ex_next)) {
+@@ -255,6 +266,22 @@ int fork_exec(struct socket *so, const char *ex)
+     return 1;
+ }
+ 
++int open_connected(struct socket *so, int s)
++{
++    DEBUG_CALL("open_connected");
++    DEBUG_ARG("so = %p", so);
++
++    if (not_valid_socket(s)) {
++        return 0;
++    }
++
++    so->s = s;
++    slirp_set_nonblock(so->s);
++    slirp_register_poll_socket(so);
++
++    return 1;
++}
++
+ int open_unix(struct socket *so, const char *unixpath)
+ {
+ #ifdef G_OS_UNIX
+diff --git a/src/misc.h b/src/misc.h
+index ff50e79..21b3959 100644
+--- a/src/misc.h
++++ b/src/misc.h
+@@ -15,6 +15,7 @@ struct gfwd_list {
+     int ex_fport; /* Port to telnet to (network order) */
+     char *ex_exec; /* Command line of what to exec */
+     char *ex_unix; /* unix socket */
++    SlirpConnectCb connect_cb; /* or a socket the application connects */
+     struct gfwd_list *ex_next;
+ };
+ 
+@@ -78,6 +79,15 @@ struct gfwd_list *add_exec(struct gfwd_list **ex_ptr, const char *cmdline,
+ struct gfwd_list *add_unix(struct gfwd_list **ex_ptr, const char *unixsock,
+                            struct in_addr addr, int port);
+ 
++/* Expose to the guest, on the given address and port, a socket connect_cb
++ * connects for each connection */
++struct gfwd_list *add_connector(struct gfwd_list **ex_ptr,
++                                SlirpConnectCb connect_cb, void *opaque,
++                                struct in_addr addr, int port);
++
++/* Take the socket a connector made for the guest connection so; 0 if none */
++int open_connected(struct socket *so, int s);
++
+ /* Remove the guest forward bound to the given address and port */
+ int remove_guestfwd(struct gfwd_list **ex_ptr, struct in_addr addr, int port);
+ 
+diff --git a/src/slirp.c b/src/slirp.c
+index 9f0c944..6f2863f 100644
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -1775,6 +1775,19 @@ int slirp_add_guestfwd(Slirp *slirp, SlirpWriteCb write_cb, void *opaque,
+     return 0;
+ }
+ 
++int slirp_add_guestfwd_connector(Slirp *slirp, SlirpConnectCb connect_cb,
++                                 void *opaque, struct in_addr *guest_addr,
++                                 int guest_port)
++{
++    if (!check_guestfwd(slirp, guest_addr, guest_port)) {
++        return -1;
++    }
++
++    add_connector(&slirp->guestfwd_list, connect_cb, opaque, *guest_addr,
++                  htons(guest_port));
++    return 0;
++}
++
+ int slirp_remove_guestfwd(Slirp *slirp, struct in_addr guest_addr,
+                           int guest_port)
+ {
+diff --git a/src/tcp_subr.c b/src/tcp_subr.c
+index 1542f18..ae6a0d8 100644
+--- a/src/tcp_subr.c
++++ b/src/tcp_subr.c
+@@ -1001,6 +1001,8 @@ int tcp_ctl(struct socket *so)
+                 so->guestfwd = ex_ptr;
+                 return 1;
+             }
++            if (ex_ptr->connect_cb)
++                return open_connected(so, ex_ptr->connect_cb(ex_ptr->opaque));
+             DEBUG_MISC(" executing %s", ex_ptr->ex_exec);
+             if (ex_ptr->ex_unix)
+                 return open_unix(so, ex_ptr->ex_unix);
