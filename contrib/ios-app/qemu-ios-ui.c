@@ -186,6 +186,9 @@ static void ios_capture(DisplaySurface *surface)
     int next, y;
     uint8_t *dst;
 
+    if (surface_bits_per_pixel(surface) != 32 || stride < w * 4) {
+        return;     /* the copies below read 4 bytes a pixel */
+    }
     ios_init_frame_lock();
     qemu_mutex_lock(&ios.frame_lock);
 

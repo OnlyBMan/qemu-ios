@@ -25,6 +25,7 @@ static int surface_width(DisplaySurface *s) { return s->w; }
 static int surface_height(DisplaySurface *s) { return s->h; }
 static int surface_stride(DisplaySurface *s) { return s->stride; }
 static void *surface_data(DisplaySurface *s) { return s->data; }
+static int surface_bits_per_pixel(DisplaySurface *s) { return 32; }
 #include "slice.h"
 int main(void) {
  enum { W = 4, H = 3, STRIDE = 20 };   /* padded rows: only W*4 bytes count */
