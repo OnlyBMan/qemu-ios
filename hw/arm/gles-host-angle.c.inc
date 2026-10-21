@@ -400,12 +400,38 @@ static void gles_angle_CopyTexSubImage2D(GLenum target, GLint level, GLint xo, G
 {
     GLES_ANGLE_ON_RECT(target, glCopyTexSubImage2D(t_, level, xo, yo, x, y, w, h));
 }
-static void gles_angle_TexParameteri(GLenum target, GLenum p, GLint v) { GLES_ANGLE_ON_RECT(target, glTexParameteri(t_, p, v)); }
-static void gles_angle_TexParameterf(GLenum target, GLenum p, GLfloat v) { GLES_ANGLE_ON_RECT(target, glTexParameterf(t_, p, v)); }
-static void gles_angle_TexParameteriv(GLenum target, GLenum p, const GLint *v) { GLES_ANGLE_ON_RECT(target, glTexParameteriv(t_, p, v)); }
-static void gles_angle_TexParameterfv(GLenum target, GLenum p, const GLfloat *v) { GLES_ANGLE_ON_RECT(target, glTexParameterfv(t_, p, v)); }
-static void gles_angle_GetTexParameteriv(GLenum target, GLenum p, GLint *v) { GLES_ANGLE_ON_RECT(target, glGetTexParameteriv(t_, p, v)); }
-static void gles_angle_GetTexParameterfv(GLenum target, GLenum p, GLfloat *v) { GLES_ANGLE_ON_RECT(target, glGetTexParameterfv(t_, p, v)); }
+/* GL_TEXTURE_MAX_LEVEL, which gles-host.c caps at the highest level uploaded so that desktop GL, which samples an
+ * incomplete texture as black, treats it as complete. ES 1.1 has none (ANGLE: GL_INVALID_ENUM, blamed on the upload
+ * or glGenerateMipmap that set it), and needs none: an ES1 context disables an incomplete texture's unit, as the
+ * devices did. There it is dropped and reads as GL's default, 1000 (a guest's own APPLE_texture_max_level in an ES1
+ * context with it: kept per texture would be the next step, should an app need it). */
+static bool gles_angle_es1_max_level(GLenum p) { return p == GL_TEXTURE_MAX_LEVEL && angle_current && !angle_current->es2; }
+static void gles_angle_TexParameteri(GLenum target, GLenum p, GLint v)
+{
+    if (!gles_angle_es1_max_level(p)) GLES_ANGLE_ON_RECT(target, glTexParameteri(t_, p, v));
+}
+static void gles_angle_TexParameterf(GLenum target, GLenum p, GLfloat v)
+{
+    if (!gles_angle_es1_max_level(p)) GLES_ANGLE_ON_RECT(target, glTexParameterf(t_, p, v));
+}
+static void gles_angle_TexParameteriv(GLenum target, GLenum p, const GLint *v)
+{
+    if (!gles_angle_es1_max_level(p)) GLES_ANGLE_ON_RECT(target, glTexParameteriv(t_, p, v));
+}
+static void gles_angle_TexParameterfv(GLenum target, GLenum p, const GLfloat *v)
+{
+    if (!gles_angle_es1_max_level(p)) GLES_ANGLE_ON_RECT(target, glTexParameterfv(t_, p, v));
+}
+static void gles_angle_GetTexParameteriv(GLenum target, GLenum p, GLint *v)
+{
+    if (gles_angle_es1_max_level(p)) *v = 1000;
+    else GLES_ANGLE_ON_RECT(target, glGetTexParameteriv(t_, p, v));
+}
+static void gles_angle_GetTexParameterfv(GLenum target, GLenum p, GLfloat *v)
+{
+    if (gles_angle_es1_max_level(p)) *v = 1000;
+    else GLES_ANGLE_ON_RECT(target, glGetTexParameterfv(t_, p, v));
+}
 
 /* Each unit's rectangle, where on, at 2D for a draw (see above); the units swapped, as a mask. */
 static unsigned gles_angle_rect_draw_begin(GLint old[], GLboolean was_on[], GLfloat matrix[][16])

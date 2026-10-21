@@ -86,6 +86,25 @@ static void row_length(void)
     assert(!memcmp(got, want, sizeof(want)) && glGetError() == GL_NO_ERROR);
 }
 
+/* The bridge caps GL_TEXTURE_MAX_LEVEL at each upload and lifts it for glGenerateMipmap: no error in either API (an ES1
+ * context has no max level and drops it), and an ES 2.0 context keeps the cap. */
+static void max_level(bool es2)
+{
+    GLuint tex;
+    GLint cap = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &cap);
+    assert(cap == 1000);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &cap);
+    assert(cap == (es2 ? 0 : 1000));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1000);
+    glGenerateMipmapOES(GL_TEXTURE_2D);
+    assert(glGetError() == GL_NO_ERROR);
+}
+
 /* The executor's APPLE_fence calls, on NV_fence. */
 static void fences(void)
 {
@@ -147,6 +166,7 @@ int main(void)
     drawable();
     unsized_storage();
     row_length();
+    max_level(false);
     fences();
     assert(!CGLSetCurrentContext(isolated) && !glIsTexture(texture));
 
@@ -158,10 +178,11 @@ int main(void)
     drawable();
     unsized_storage();
     row_length();
+    max_level(true);
     fences();
     CGLReleaseContext(es2);
     CGLReleaseContext(child); CGLReleaseContext(isolated);
     assert(!angle_current);
     puts("PASS: actual EGL adapter owns context state, sharegroup lifetime, FBO readback and destruction; "
-         "ES 2.0 contexts compile guest GLSL and build the drawable, both APIs store unsized images, take rows longer than the image and fence");
+         "ES 2.0 contexts compile guest GLSL and build the drawable, both APIs store unsized images, take rows longer than the image, cap levels and fence");
 }
