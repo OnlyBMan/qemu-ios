@@ -1,6 +1,7 @@
 /* The GL bridge built for ANGLE, against real ANGLE Metal contexts: a sampled surface refreshes from guest memory
  * in an ES 2.0 context as in an ES1 one, the bridge's own checks of a draw raise no GL error in either, and a
- * surface bound at GL_TEXTURE_RECTANGLE (2.x and 3.x CoreAnimation's) samples by texel and takes rendering.
+ * surface bound at GL_TEXTURE_RECTANGLE (2.x and 3.x CoreAnimation's) samples by texel, takes rendering and is
+ * charged to itself, a video frame's NV12 surface converts, and an RGB PVRTC texture uploads.
  * Run by tests/ipad1/angle-slice.sh.
  *
  * SLICE:gles-prelude hw/arm/gles-host.c range #include <TargetConditionals.h> | /* Old guest engines retain
@@ -9,6 +10,7 @@
  * SLICE hw/arm/gles-host.c fn gles_reject
  * SLICE hw/arm/gles-host.c range #define GLES_PRIVATE_NAME | static bool gles_is_drawable(
  * SLICE hw/arm/gles-host.c range static GLESPVRTC *gles_pvrtc_texture( | static int64_t gles_generate_mipmap(
+ * SLICE:pvrtcup hw/arm/gles-host.c fn pvrtc_size pvrtc_decode gles_fetch_texels gles_decode_buf gles_report_decode gles_pvrtc_upload
  * SLICE:helpers hw/arm/gles-host.c fn gles_image_bytes gles_read_pixels
  * SLICE:helpers hw/arm/gles-host.c range static bool gles_surface_range( | /* ------------------------------------------------------------ ES 2.0
  * SLICE:draw hw/arm/gles-host.c fn gles_is_drawable gles_host_fbo gles_texcoord_mask gles_check_texcoords
@@ -73,6 +75,9 @@ static bool physical_memory_test_and_clear_dirty(ram_addr_t at, ram_addr_t len, 
 static int gles_strict = 1, gles_prof;
 static uint64_t gles_t(void) { return 0; }
 #include "draw.h"
+/* The decoder is C++ (tests/slice/ipod-pvrtc-upload.c builds it); uploads here have no data to decode. */
+static bool ltm_pvrtc_decode(const uint8_t *s, uint32_t w, uint32_t h, int bpp, bool a, bool p, uint8_t *d) { return false; }
+#include "pvrtcup.h"
 
 /* Texel (0, 0) of the texture bound at GL_TEXTURE_2D, through a scratch FBO (ES has no glGetTexImage). */
 static void texel(uint8_t out[4])
@@ -175,6 +180,10 @@ static void rectangle(void)
     glGenTextures(1, &src);
     glBindTexture(GL_TEXTURE_RECTANGLE_ARB, src);
     assert(!gles_bind_surface(NULL, a, 0));
+    /* charged to the rectangle texture itself (face 7), not to the unit's 2D binding: each rectangle's image counts
+     * against GLES_MAX_GPU_BYTES once */
+    assert((uintptr_t)g_hash_table_lookup(gh.charged, gles_charge_key(GLES_CHARGE_TEXTURE, src, 7, 0)) == 4 * 2 * 4);
+    assert(!g_hash_table_lookup(gh.charged, gles_charge_key(GLES_CHARGE_TEXTURE, plain, 0, 0)));
     glTexParameteri(GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glGetTexParameteriv(GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_WRAP_S, &v);
     assert(v == GL_CLAMP_TO_EDGE);
@@ -220,9 +229,61 @@ static void rectangle(void)
     CGLReleaseContext(c);
 }
 
+/* A video frame: a 2x2 '420v' surface (NV12, video range) converted to BGRA by the bridge, black at Y 16 and white at
+ * Y 235 with neutral chroma, in an ES1 context (the iPod touch 2G's movie player). */
+static void nv12(void)
+{
+    GLESAngleContextRef c;
+    GLuint tex;
+    uint8_t got[4];
+    uint32_t a[] = { GL_TEXTURE_2D, 0x10000000, 2, 2, 2, 0x34323076, 0x10000100, 2 };
+
+    memset(&gh, 0, sizeof(gh));
+    assert(gles_angle_create(NULL, false, &c) && !CGLSetCurrentContext(c));
+    gh.cgl = c;
+    gh.surfaces = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    memset(ram, 0, sizeof(ram));
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    memset(ram, 16, 4);
+    ram[256] = ram[257] = 128;
+    assert(!gles_bind_surface(NULL, a, 0));
+    texel(got);
+    assert(!memcmp(got, "\0\0\0\xff", 4));
+    memset(ram, 235, 4);
+    assert(!gles_bind_surface(NULL, a, 0));
+    texel(got);
+    assert(!memcmp(got, "\xff\xff\xff\xff", 4));
+    assert(glGetError() == GL_NO_ERROR && !gles_rejects);
+    g_hash_table_destroy(gh.surfaces);
+    CGLSetCurrentContext(NULL);
+    CGLReleaseContext(c);
+}
+
+/* An RGB PVRTC texture (decoded to RGBA texels) and its replacement, in an ES1 context: an ES host takes them only
+ * into RGBA storage. */
+static void pvrtc_rgb(void)
+{
+    GLESAngleContextRef c;
+    GLuint tex;
+
+    memset(&gh, 0, sizeof(gh));
+    assert(gles_angle_create(NULL, false, &c) && !CGLSetCurrentContext(c));
+    gh.cgl = c;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    assert(!gles_pvrtc_upload(NULL, GL_TEXTURE_2D, 0, PVRTC_RGB_4BPP, 8, 8, 0, 32, 0, false));
+    assert(!gles_pvrtc_upload(NULL, GL_TEXTURE_2D, 0, PVRTC_RGB_4BPP, 8, 8, 0, 32, 0, true));
+    assert(glGetError() == GL_NO_ERROR && !gh.error && !gles_rejects);
+    CGLSetCurrentContext(NULL);
+    CGLReleaseContext(c);
+}
+
 int main(void)
 {
     rectangle();
+    nv12();
+    pvrtc_rgb();
     refresh(false);
     refresh(true);
     check_draw(true);           /* first: gles_check_texcoords warns once */

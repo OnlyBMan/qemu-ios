@@ -809,7 +809,7 @@ static bool gles_charge_texture(uint32_t target, uint32_t level, uint64_t bytes)
     if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) {
         face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X + 1;
         glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &name);
-#ifndef GLES_HOST_EAGL
+#if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE)
     } else if (target == GL_TEXTURE_RECTANGLE_ARB) {
         face = 7;
         glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &name);
@@ -4288,7 +4288,13 @@ static int64_t gles_pvrtc_upload(CPUState *cpu, uint32_t target, uint32_t level,
     if (replace) {
         glTexSubImage2D(target, level, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, dst);
     } else {
+        /* An ES host takes RGBA texels only into RGBA storage (GL_RGB would be GL_INVALID_OPERATION, and so would a
+         * replacement's RGBA glTexSubImage2D); the RGB formats decode with alpha 255, so they sample the same. */
+#ifdef GLES_HOST_ANGLE
+        GLenum internal = GL_RGBA;
+#else
         GLenum internal = (format == PVRTC_RGB_2BPP || format == PVRTC_RGB_4BPP) ? GL_RGB : GL_RGBA;
+#endif
         glTexImage2D(target, level, internal, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, dst);
     }
     return gles_texture_end(target, level, (GLESPVRTCLevel){ w, h, format });
@@ -4400,7 +4406,7 @@ static bool gles_surface_read(CPUState *cpu, uint32_t base, uint32_t stride,
     return true;
 }
 
-#ifndef GLES_HOST_EAGL
+#if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE)
 /* NV12 to BGRA, ITU-R BT.601 in 16.16 fixed point, each chroma sample covering its 2x2 block: what
  * VTPixelTransferSession made of '420v' (video range) and '420f' (full range), within 1 per channel
  * (0.55% and 0.49% of all Y, Cb, Cr combinations differ by 1). Its full range scales chroma by 256/255,
@@ -4992,7 +4998,7 @@ static int64_t gles_bind_surface(CPUState *cpu, const uint32_t *a, uint32_t id)
     if (surface->npages) {
         gles_surface_fetch(surface, pixels);    /* every page was just mapped: no fault can come */
     } else if (nv12) {
-#ifndef GLES_HOST_EAGL
+#if !defined(GLES_HOST_EAGL) || defined(GLES_HOST_ANGLE)
         if ((w | h) & 1) {
             gles_refuse("surface:nv12:odd-size");
             gles_debug_texture(target);
