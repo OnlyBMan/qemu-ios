@@ -775,7 +775,7 @@ static bool video_compose(S5L8930DisplayState *s, unsigned w, unsigned h, uint32
         for (unsigned x = x0; x < MIN(x0 + dw, w); x++) {
             unsigned sx = (unsigned)((uint64_t)(x - x0) * sw / dw);
             const uint8_t *c = uvp + (size_t)(sy / 2) * sw + (sx & ~1u);
-            int in[3] = { yp[(size_t)sy * sw + sx] - 16, c[0] - 128, c[1] - 128 };
+            int in[3] = { /* bounded: sy < sh, sx < sw */ yp[(size_t)sy * sw + sx] - 16, c[0] - 128, c[1] - 128 };
             uint32_t px = 0xff000000u;
             for (int k = 0; k < 3; k++) {
                 int v = (m[k * 3] * in[0] + m[k * 3 + 1] * in[1] + m[k * 3 + 2] * in[2] + 2048) >> 12;

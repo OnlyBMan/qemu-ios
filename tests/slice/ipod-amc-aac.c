@@ -4,6 +4,7 @@
  * buffer contract independently of any guest app or copyrighted media asset.
  *
  * SLICE include/hw/arm/ipod_touch_amc.h define AMC_
+ * SLICE:amc include/hw/arm/ipod_touch_guard.h range static inline uint64_t it_guard_idx | #endif /* HW_ARM_IPOD_TOUCH_GUARD_H
  * SLICE:amc hw/arm/ipod_touch_amc.c fn amc_local
  * SLICE:amc hw/arm/ipod_touch_amc.c range typedef enum AMCProgram | \n#else
  * SLICE:amc hw/arm/ipod_touch_amc.c fn amc_update_irq amc_ctrl_of
@@ -86,6 +87,9 @@ static int address_space_write(void *as, hwaddr a, int attrs, const void *src, s
     void *p = memory(a,n); if (!p) return -1; memcpy(p,src,n); return 0;
 }
 static void word(unsigned offset, uint32_t v) { v = GUINT32_TO_LE(v); memcpy(dram+offset,&v,4); }
+#include <inttypes.h>
+#define LOG_GUEST_ERROR 2
+#define qemu_log_mask(...) ((void)0)
 #include "amc.h"
 static AMCDecoder *snapshot_decoder(AMCDecoder *d)
 {

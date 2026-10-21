@@ -279,7 +279,7 @@ static bool vxd_more_slices(const uint8_t next[6], bool annexb)
 {
     unsigned h = annexb ? (!next[0] && !next[1] && next[2] == 1 ? 3 : ldl_be_p(next) == 1 ? 4 : 0)
                         : (ldl_be_p(next) - 1u > 0x3fffff ? 0 : 4);
-    return h && vxd_slice_nal(next[h]) && !(next[h + 1] & 0x80);
+    return h && vxd_slice_nal(next[h]) && !(next[h + 1] & 0x80);   /* bounded: h is 0, 3 or 4 */
 }
 
 /* Decode one slice (vxd_nal_start says where its NAL is). */
@@ -290,7 +290,7 @@ static int vxd_decode(S5L8920VXDState *s, uint32_t ptd, const VXDRender *r)
     uint32_t base = r->bs_va - BACK, end = r->bs_va + r->bs_len;
     g_autofree uint8_t *buf = g_malloc(BACK + r->bs_len);
 
-    if (r->bs_va < BACK || !vxd_rw(ptd, base, buf, BACK + r->bs_len, false)) {
+    if (r->bs_va < BACK || !r->bs_len || !vxd_rw(ptd, base, buf, BACK + r->bs_len, false)) {
         return -1;
     }
     bool annexb;
@@ -349,7 +349,7 @@ static void vxd_firmware_start(S5L8920VXDState *s)
 
 static void vxd_post(S5L8920VXDState *s, const uint32_t *msg, unsigned words)
 {
-    uint32_t wr = *vxd_comms(s, COMMS_TO_HOST_WR);
+    uint32_t wr = *vxd_comms(s, COMMS_TO_HOST_WR) % TO_HOST_WORDS;   /* the guest writes the index */
     for (unsigned i = 0; i < words; i++) {
         s->comms[TO_HOST_OFF / 4 + wr] = msg[i];
         wr = (wr + 1) % TO_HOST_WORDS;
@@ -417,14 +417,26 @@ static void vxd_message(S5L8920VXDState *s, const uint32_t *msg, unsigned words)
 static void vxd_kick(S5L8920VXDState *s)
 {
     uint32_t rd = *vxd_comms(s, COMMS_TO_MTX_RD), wr = *vxd_comms(s, COMMS_TO_MTX_WR);
+    /* At most one ring's worth per kick (a wrap counts as a word): the guest writes
+     * both indices, and one that never meets the other would spin with the BQL held. */
+    unsigned budget = TO_MTX_WORDS + 1;
 
-    while (rd != wr && rd < TO_MTX_WORDS) {
+    if (wr >= TO_MTX_WORDS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "vxd: to-MTX write index %u out of range\n", wr);
+        return;
+    }
+    while (rd != wr && rd < TO_MTX_WORDS && budget) {
         uint32_t msg[TO_MTX_WORDS];
         unsigned words = ((s->comms[TO_MTX_OFF / 4 + rd] & 0xff) + 3) / 4;
         if (!words) {
             rd = 0;   /* a padding word: the host wrapped */
+            budget--;
             continue;
         }
+        if (words > budget) {
+            break;
+        }
+        budget -= words;
         for (unsigned i = 0; i < words && i < TO_MTX_WORDS; i++) {
             msg[i] = s->comms[TO_MTX_OFF / 4 + rd];
             rd = (rd + 1) % TO_MTX_WORDS;
