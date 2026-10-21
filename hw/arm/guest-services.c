@@ -33,6 +33,10 @@
 #include "hw/core/platform-bus.h"
 #include "hw/arm/ipod_touch_2g.h"
 #include "cpu.h"
+#include "accel/tcg/probe.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "exec/target_page.h"
+#include "exec/tlb-flags.h"
 
 int32_t guest_svcs_errno = 0;
 
@@ -42,27 +46,63 @@ uint64_t qemu_call_status(CPUARMState *env, const struct ARMCPRegInfo *ri)
     return 0;
 }
 
-static int agent_copy(void *opaque, uint32_t address, uint8_t *data,
-                      size_t length, bool write)
+/*
+ * Guest memory for a guest-services caller, at the caller's privilege: the
+ * vCPU's TLB as a load or store at its current MMU index would see it. Plain
+ * RAM goes through the host pointers (guest_rw_ram); a page the caller may
+ * access that isn't plain RAM (MMIO, dirty tracking, a watchpoint) takes a
+ * debug access. A page the caller can't access at its level is refused for an
+ * unprivileged caller, so User code can't reach kernel or read-only pages
+ * through the host; a privileged caller (the kernel, which owns the page
+ * tables anyway) gets the debug access, as before. Returns 0 or -1.
+ */
+int guest_copy(void *opaque, uint32_t address, uint8_t *data, size_t length,
+               bool write)
 {
-    if (length && length - 1 > UINT32_MAX - address) {
+    CPUState *cpu = opaque;
+    CPUArchState *env = cpu_env(cpu);
+    MMUAccessType type = write ? MMU_DATA_STORE : MMU_DATA_LOAD;
+    int idx = cpu_mmu_index(cpu, false);
+    bool user = (env->uncached_cpsr & CPSR_M) == ARM_CPU_MODE_USR;
+    vaddr p = address, last = (vaddr)address + length - 1;
+    void *host;
+
+    if (!length) {
+        return 0;
+    }
+    if (last > UINT32_MAX) {
         return -1;
     }
-    return cpu_memory_rw_debug(opaque, address, data, length, write);
+    if (guest_rw_ram(cpu, address, data, length, write)) {
+        return 0;
+    }
+    for (;;) {
+        if (probe_access_flags(env, p, 0, type, idx, true, &host, 0) &
+            TLB_INVALID_MASK) {
+            if (user) {
+                return -1;
+            }
+            break;
+        }
+        if ((p & TARGET_PAGE_MASK) == (last & TARGET_PAGE_MASK)) {
+            break;
+        }
+        p = (p & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+    }
+    /* bounded: data is the caller's, length bytes long */
+    return cpu_memory_rw_debug(cpu, address, data, length, write) ? -1 : 0;
 }
 
 /*
- * The request block, read and its reply written back once per call (every GL call is one): through the host pointers
- * in the vCPU's TLB, as the GL bridge reaches client arrays, instead of a debug access that walks the page tables and
- * dispatches through the address space each time. A page that isn't plain RAM in the TLB, is unmapped or doesn't
- * allow the access at the caller's level takes the debug access as before, which redoes the whole block.
+ * The request block, read and its reply written back once per call (every GL
+ * call is one), through guest_copy.
  */
 int qemu_call_rw(CPUState *cpu, uint64_t va, qemu_call_t *q, bool write)
 {
-    if (guest_rw_ram(cpu, va, (uint8_t *)q, sizeof(*q), write)) {
-        return 0;
+    if (va > UINT32_MAX) {
+        return -1;
     }
-    return cpu_memory_rw_debug(cpu, va, q, sizeof(*q), write);
+    return guest_copy(cpu, va, (uint8_t *)q, sizeof(*q), write);
 }
 
 void qemu_call(CPUARMState *env, const struct ARMCPRegInfo *ri, uint64_t value)
@@ -170,7 +210,7 @@ void qemu_call(CPUARMState *env, const struct ARMCPRegInfo *ri, uint64_t value)
                 qcall.args.ag.token, qcall.args.ag.buffer_guest_ptr,
                 qcall.args.ag.offset, qcall.args.ag.length,
                 qemu_clock_get_ms(QEMU_CLOCK_REALTIME), candidate,
-                agent_copy, cpu);
+                guest_copy, cpu);
             guest_svcs_errno = qcall.retval < 0 ? EINVAL : 0;
             break;
         }

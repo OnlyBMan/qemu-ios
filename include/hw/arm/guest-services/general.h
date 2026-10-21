@@ -194,6 +194,9 @@ struct ARMCPRegInfo;
 uint64_t qemu_call_status(CPUARMState *env, const struct ARMCPRegInfo *ri);
 void qemu_call(CPUARMState *env, const struct ARMCPRegInfo *ri, uint64_t value);
 int qemu_call_rw(CPUState *cpu, uint64_t va, qemu_call_t *q, bool write);
+/* Guest memory at the caller's privilege (opaque: the CPUState); 0 or -1. */
+int guest_copy(void *opaque, uint32_t address, uint8_t *data, size_t length,
+               bool write);
 #else
 uint32_t qemu_call_status(qemu_call_t *qcall);
 void qemu_call(qemu_call_t *qcall);
