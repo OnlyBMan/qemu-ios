@@ -54,6 +54,38 @@ static void unsized_storage(void)
     assert(got[0] == 50 && got[1] == 100 && got[2] == 200 && got[3] == 255);
 }
 
+/* An upload whose rows are longer than the image (GL_UNPACK_ROW_LENGTH, which the bridge sets for the guest's
+ * GL_UNPACK_ROW_BYTES_APPLE and clears after every upload): no error in either API, and the image's own texels. */
+static void row_length(void)
+{
+    static const unsigned char rows[] = {1, 2, 3, 255, 4, 5, 6, 255, 99, 99, 99, 99,
+                                         7, 8, 9, 255, 10, 11, 12, 255};
+    static const unsigned char want[] = {1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255};
+    GLuint tex, fbo;
+    unsigned char got[16];
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGenFramebuffersOES(1, &fbo);
+    glBindFramebufferOES(GL_FRAMEBUFFER_OES, fbo);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 3);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, rows);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    assert(glGetError() == GL_NO_ERROR);
+    glFramebufferTexture2DOES(GL_FRAMEBUFFER_OES, GL_COLOR_ATTACHMENT0_OES, GL_TEXTURE_2D, tex, 0);
+    glReadPixels(0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    assert(!memcmp(got, want, sizeof(want)));
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 3);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, rows);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    assert(glGetError() == GL_NO_ERROR);
+    glFramebufferTexture2DOES(GL_FRAMEBUFFER_OES, GL_COLOR_ATTACHMENT0_OES, GL_TEXTURE_2D, tex, 0);
+    glReadPixels(0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    assert(!memcmp(got, want, sizeof(want)) && glGetError() == GL_NO_ERROR);
+}
+
 /* The executor's APPLE_fence calls, on NV_fence. */
 static void fences(void)
 {
@@ -114,6 +146,7 @@ int main(void)
     assert(!memcmp(got, pixels, 4) && glGetError() == GL_NO_ERROR);
     drawable();
     unsized_storage();
+    row_length();
     fences();
     assert(!CGLSetCurrentContext(isolated) && !glIsTexture(texture));
 
@@ -124,10 +157,11 @@ int main(void)
     es2_program();
     drawable();
     unsized_storage();
+    row_length();
     fences();
     CGLReleaseContext(es2);
     CGLReleaseContext(child); CGLReleaseContext(isolated);
     assert(!angle_current);
     puts("PASS: actual EGL adapter owns context state, sharegroup lifetime, FBO readback and destruction; "
-         "ES 2.0 contexts compile guest GLSL and build the drawable, both APIs store unsized images and fence");
+         "ES 2.0 contexts compile guest GLSL and build the drawable, both APIs store unsized images, take rows longer than the image and fence");
 }

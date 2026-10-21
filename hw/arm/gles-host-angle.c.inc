@@ -16,6 +16,7 @@ typedef struct GLESAngleContext {
     EGLSurface surface;
     unsigned refs;
     bool es2;
+    GLint row_length;       /* GL_UNPACK_ROW_LENGTH in an ES1 context, which keeps it here (below) */
     /* GL_TEXTURE_RECTANGLE, per unit (below), and the group's rectangle textures' level-0 sizes. */
     GLuint rect[8];
     bool rect_on[8];
@@ -122,12 +123,60 @@ static void gles_angle_clip_plane(GLenum plane, const double *value)
 /* ES stores an unsized image in its own format (and BGRA texels only in BGRA storage,
  * EXT_texture_format_BGRA8888), where the executor names the desktop's RGBA storage for any of
  * them. Each samples as it did from RGBA storage: RGB and luminance with alpha 1, alpha as (0, 0, 0, a). */
+/*
+ * ES 1.1 has no GL_UNPACK_ROW_LENGTH, and ANGLE refuses it in an ES1 context (GL_INVALID_ENUM), where the bridge
+ * sets it around every upload (gles_unpack_apply, gles_unpack_tight): the error was blamed on the guest's upload,
+ * which the bridge then reported failed and uncharged though the host had made it. An ES1 context keeps the row
+ * length itself, and an upload with one longer than the image is repacked into tight rows first (the bridge sets
+ * GL_UNPACK_ALIGNMENT 1 with a row length, gles_unpack_layout).
+ */
+static void gles_angle_PixelStorei(GLenum pname, GLint value)
+{
+    if (pname == GL_UNPACK_ROW_LENGTH && angle_current && !angle_current->es2) {
+        angle_current->row_length = value;
+        return;
+    }
+    glPixelStorei(pname, value);
+}
+#undef glPixelStorei
+#define glPixelStorei gles_angle_PixelStorei
+
+/* Bytes in a texel of an ES upload, 0 for anything else. */
+static size_t gles_angle_texel_bytes(GLenum fmt, GLenum type)
+{
+    size_t n = fmt == GL_RGBA || fmt == GL_BGRA_EXT ? 4 : fmt == GL_RGB ? 3 : fmt == GL_LUMINANCE_ALPHA ? 2 :
+               fmt == GL_ALPHA || fmt == GL_LUMINANCE ? 1 : 0;
+    switch (type) {
+    case GL_UNSIGNED_BYTE: return n;
+    case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_4_4_4_4: case GL_UNSIGNED_SHORT_5_5_5_1: return 2;
+    case 0x8D61 /* GL_HALF_FLOAT_OES */: case GL_HALF_FLOAT: return n * 2;
+    case GL_FLOAT: return n * 4;
+    default: return 0;
+    }
+}
+
+/* PIXELS as tight rows, in *TIGHT (freed by the caller), where an ES1 context's row length says they aren't. */
+static const void *gles_angle_unpack(GLsizei w, GLsizei h, GLenum fmt, GLenum type, const void *pixels,
+                                     uint8_t **tight)
+{
+    size_t bpp = gles_angle_texel_bytes(fmt, type);
+    GLint rl = angle_current && !angle_current->es2 ? angle_current->row_length : 0;
+    *tight = NULL;
+    if (!pixels || w <= 0 || h <= 0 || rl <= w || !bpp) return pixels;
+    *tight = g_malloc((size_t)w * h * bpp);
+    for (GLsizei y = 0; y < h; y++) {
+        memcpy(*tight + (size_t)y * w * bpp, (const uint8_t *)pixels + (size_t)y * rl * bpp, (size_t)w * bpp);
+    }
+    return *tight;
+}
+
 static void gles_angle_tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                                     GLint border, GLenum fmt, GLenum type, const void *pixels)
 {
+    g_autofree uint8_t *tight = NULL;
     if (ifmt == GL_RGBA && (fmt == GL_BGRA_EXT || fmt == GL_RGB || fmt == GL_ALPHA ||
                             fmt == GL_LUMINANCE || fmt == GL_LUMINANCE_ALPHA)) ifmt = fmt;
-    glTexImage2D(target, level, ifmt, w, h, border, fmt, type, pixels);
+    glTexImage2D(target, level, ifmt, w, h, border, fmt, type, gles_angle_unpack(w, h, fmt, type, pixels, &tight));
 }
 #undef glTexImage2D
 #define glTexImage2D gles_angle_tex_image_2d
@@ -336,7 +385,9 @@ static void gles_angle_TexImage2D(GLenum target, GLint level, GLint ifmt, GLsize
 static void gles_angle_TexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
                                      GLenum fmt, GLenum type, const void *pixels)
 {
-    GLES_ANGLE_ON_RECT(target, glTexSubImage2D(t_, level, x, y, w, h, fmt, type, pixels));
+    g_autofree uint8_t *tight = NULL;
+    const void *px = gles_angle_unpack(w, h, fmt, type, pixels, &tight);
+    GLES_ANGLE_ON_RECT(target, glTexSubImage2D(t_, level, x, y, w, h, fmt, type, px));
 }
 static void gles_angle_CopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y,
                                       GLsizei w, GLsizei h, GLint border)
