@@ -130,6 +130,7 @@ static void h264_nal(IPodH264State *s)
     }
 }
 
+#ifdef IT_HAVE_AVCODEC
 /* Build a coded NAL from parsed hardware fields. The macroblock payload is
  * preserved bit-for-bit; original software-only SPS/PPS IDs are irrelevant. */
 static void h264_put(uint8_t *buf, unsigned *bit, uint32_t value, unsigned n)
@@ -449,7 +450,6 @@ static GByteArray *h264_reference_pixels(IPodH264State *s, uint32_t y,
     return h264_escape(picture, bit);
 }
 
-#ifdef IT_HAVE_AVCODEC
 /* One hardware job is one slice. libavcodec's chunk mode retains a partial
  * picture between jobs; a single-slice picture completes in its own job.
  * ponytail: commit DMA on picture completion. Replay only when a later slice
@@ -639,6 +639,7 @@ static bool h264_decode(IPodH264State *s)
 #ifdef IT_HAVE_AVCODEC
     return h264_decode_software(s);
 #else
+    warn_report_once("H264: built without libavcodec; the iPod touch 2G decodes no video");
     return false;
 #endif
 }

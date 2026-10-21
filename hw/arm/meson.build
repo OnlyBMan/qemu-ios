@@ -158,6 +158,8 @@ ipod_avutil = dependency('libavutil', required: false)
 if ipod_avcodec.found() and ipod_avutil.found()
   arm_ss.add(when: 'CONFIG_IPOD_TOUCH_2G', if_true: declare_dependency(
     dependencies: [ipod_avcodec, ipod_avutil], compile_args: ['-DIT_HAVE_AVCODEC']))
+else
+  warning('libavcodec/libavutil not found: the iPod touch 2G will decode no H.264 video and no raw AAC')
 endif
 
 hw_arch += {'arm': arm_ss}
