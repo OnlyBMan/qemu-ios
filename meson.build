@@ -1324,11 +1324,13 @@ if not get_option('slirp').auto() or have_system
   # net_slirp_set_restrict() (netdev_set_restrict, qemu_ios_ui_net_restrict) flips a
   # running stack's restrict flag in place with slirp_set_restricted(), and lan=off /
   # qemu_ios_ui_net_lan refuse local-network destinations with slirp_set_local_network()
-  # (the guest's DNS through net/slirp-dns.c on macOS, slirp_set_dns_forward()),
-  # both from subprojects/packagefiles/libslirp-set-restricted.patch. A libslirp built with
-  # the patch (the app's static native root) is used as found; one without it (Homebrew's)
-  # gives way to the patched subproject, static so the binaries gain no runtime dylib.
-  if slirp.found() and not cc.has_function('slirp_set_dns_forward', dependencies: slirp,
+  # (the guest's DNS through net/slirp-dns.c on macOS, slirp_set_dns_forward()), and no
+  # destination on the host itself is reachable (slirp_destination_class()), all from
+  # subprojects/packagefiles/libslirp-set-restricted.patch. A libslirp built with the
+  # patch (the app's static native root) is used as found; one without it (Homebrew's, or
+  # one from an older patch) gives way to the patched subproject, static so the binaries
+  # gain no runtime dylib.
+  if slirp.found() and not cc.has_function('slirp_destination_class', dependencies: slirp,
                                            prefix: '#include <libslirp.h>')
     slirp = subproject('slirp', default_options: ['default_library=static']).get_variable('libslirp_libdep')
   endif

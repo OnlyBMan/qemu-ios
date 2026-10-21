@@ -776,6 +776,10 @@ static int net_slirp_init(NetClientState *peer, const char *model,
          SLIRP_CHECK_VERSION(4, 9, 0) ? 6 :
          SLIRP_CHECK_VERSION(4, 7, 0) ? 4 : 1;
     cfg.restricted = restricted;
+    /* The gateway (10.0.2.2) is not the host's loopback: the guest is not
+     * trusted with the host's own services. libslirp's patch refuses any
+     * loopback destination besides (slirp_destination_class). */
+    cfg.disable_host_loopback = true;
     cfg.in_enabled = ipv4;
     cfg.vnetwork = net;
     cfg.vnetmask = mask;

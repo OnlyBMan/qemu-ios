@@ -1,36 +1,38 @@
 diff --git a/src/ip6_icmp.c b/src/ip6_icmp.c
-index abb1a993..7308c9a8 100644
+index abb1a993..ff10a4c4 100644
 --- a/src/ip6_icmp.c
 +++ b/src/ip6_icmp.c
-@@ -566,7 +566,8 @@ void icmp6_input(struct mbuf *m)
+@@ -566,7 +566,9 @@ void icmp6_input(struct mbuf *m)
      case ICMP6_ECHO_REQUEST:
          if (in6_equal_host(&ip->ip_dst)) {
              icmp6_send_echoreply(m, slirp, ip, icmp);
 -        } else if (slirp->restricted) {
 +        } else if (slirp->restricted ||
-+                   (slirp->local_network_blocked && slirp_local_network_addr6(&ip->ip_dst))) {
++                   !slirp_destination_allowed(slirp, (struct sockaddr *)&(struct sockaddr_in6){
++                       .sin6_family = AF_INET6, .sin6_addr = ip->ip_dst })) {
              goto freeit;
          } else {
              struct socket *so;
 diff --git a/src/ip_icmp.c b/src/ip_icmp.c
-index d8fe7cb2..ab6cfdcb 100644
+index d8fe7cb2..4d5225bf 100644
 --- a/src/ip_icmp.c
 +++ b/src/ip_icmp.c
-@@ -206,7 +206,8 @@ void icmp_input(struct mbuf *m, int hlen)
+@@ -206,7 +206,9 @@ void icmp_input(struct mbuf *m, int hlen)
          if (ip->ip_dst.s_addr == slirp->vhost_addr.s_addr ||
              ip->ip_dst.s_addr == slirp->vnameserver_addr.s_addr) {
              icmp_reflect(m);
 -        } else if (slirp->restricted) {
 +        } else if (slirp->restricted ||
-+                   (slirp->local_network_blocked && slirp_local_network_addr4(ip->ip_dst))) {
++                   !slirp_destination_allowed(slirp, (struct sockaddr *)&(struct sockaddr_in){
++                       .sin_family = AF_INET, .sin_addr = ip->ip_dst })) {
              goto freeit;
          } else {
              struct socket *so;
 diff --git a/src/libslirp.h b/src/libslirp.h
-index 240dfe8b..f96ddbbc 100644
+index 240dfe8b..4607168e 100644
 --- a/src/libslirp.h
 +++ b/src/libslirp.h
-@@ -268,6 +268,28 @@ Slirp *slirp_init(int restricted, bool in_enabled, struct in_addr vnetwork,
+@@ -268,6 +268,51 @@ Slirp *slirp_init(int restricted, bool in_enabled, struct in_addr vnetwork,
  SLIRP_EXPORT
  void slirp_cleanup(Slirp *slirp);
  
@@ -41,11 +43,34 @@ index 240dfe8b..f96ddbbc 100644
 +SLIRP_EXPORT
 +void slirp_set_restricted(Slirp *slirp, int restricted);
 +
-+/* Allow or refuse guest traffic to local-network destinations on the host's
-+ * side (10/8, 172.16/12, 192.168/16, 169.254/16, 224/4, fc00::/7, fe80::/10,
-+ * ff00::/8). Refused, such a connection or datagram fails as if unreachable;
-+ * loopback forwards stay reachable, and so does the host's own DNS server (the
-+ * guest's 10.0.2.3) unless slirp_set_dns_forward gives a resolver instead. Allowed by default; takes effect on the next connection. */
++/* Where guest traffic may go on the host's side, by the address a connection
++ * or datagram would be sent to (LightTouchMac's NetworkPolicy is the same rule):
++ *   SLIRP_DESTINATION_HOST    the host itself (0/8, 127/8, ::, ::1): never, so
++ *                             the gateway's address does not lead to the host's
++ *                             loopback services either;
++ *   SLIRP_DESTINATION_LOCAL   its local networks (10/8, 172.16/12, 192.168/16,
++ *                             169.254/16, 100.64/10, 198.18/15, 224/3, fc00::/7,
++ *                             fe80::/10, fec0::/10, ff00::/8): while
++ *                             slirp_set_local_network allows;
++ *   SLIRP_DESTINATION_PUBLIC  everything else.
++ * Allowing a connection, the host's own interface addresses that would
++ * otherwise be public count as local.
++ * An IPv6 address carrying an IPv4 one (v4-mapped, v4-translated, v4-compatible,
++ * NAT64 64:ff9b::/96) is judged as that IPv4 address. The guest's DNS to its
++ * virtual nameserver is the one exemption: the host's resolver may sit on the
++ * LAN or on loopback. Any other address family is SLIRP_DESTINATION_HOST. */
++enum {
++    SLIRP_DESTINATION_PUBLIC,
++    SLIRP_DESTINATION_LOCAL,
++    SLIRP_DESTINATION_HOST,
++};
++SLIRP_EXPORT
++int slirp_destination_class(const struct sockaddr *addr);
++
++/* Allow or refuse guest traffic to SLIRP_DESTINATION_LOCAL destinations.
++ * Refused, such a connection or datagram fails as if unreachable; the host's own
++ * DNS server (the guest's 10.0.2.3) stays reachable unless slirp_set_dns_forward
++ * gives a resolver instead. Allowed by default; takes effect on the next connection. */
 +SLIRP_EXPORT
 +void slirp_set_local_network(Slirp *slirp, int allowed);
 +
@@ -60,10 +85,10 @@ index 240dfe8b..f96ddbbc 100644
  SLIRP_EXPORT
  void slirp_pollfds_fill(Slirp *slirp, uint32_t *timeout,
 diff --git a/src/slirp.c b/src/slirp.c
-index 0fc51a96..e30c2194 100644
+index 0fc51a96..9f0c944c 100644
 --- a/src/slirp.c
 +++ b/src/slirp.c
-@@ -782,6 +782,38 @@ void slirp_cleanup(Slirp *slirp)
+@@ -782,6 +782,142 @@ void slirp_cleanup(Slirp *slirp)
      g_free(slirp);
  }
  
@@ -85,25 +110,129 @@ index 0fc51a96..e30c2194 100644
 +    }
 +}
 +
-+bool slirp_local_network_addr4(struct in_addr a)
++static int slirp_destination_class4(const uint8_t *b)
 +{
-+    uint32_t h = ntohl(a.s_addr);
-+    return (h >> 24) == 10 || (h >> 20) == 0xac1 || (h >> 16) == 0xc0a8 ||
-+           (h >> 16) == 0xa9fe || (h >> 28) == 0xe || h == 0xffffffff;
++    if (b[0] == 0 || b[0] == 127) {
++        return SLIRP_DESTINATION_HOST;
++    }
++    if (b[0] == 10 || (b[0] == 172 && (b[1] & 0xf0) == 16) ||
++        (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254) ||
++        (b[0] == 100 && (b[1] & 0xc0) == 64) || (b[0] == 198 && (b[1] & 0xfe) == 18) ||
++        b[0] >= 224) {
++        return SLIRP_DESTINATION_LOCAL;
++    }
++    return SLIRP_DESTINATION_PUBLIC;
 +}
 +
-+bool slirp_local_network_addr6(const struct in6_addr *a)
++int slirp_destination_class(const struct sockaddr *addr)
 +{
-+    const uint8_t *b = a->s6_addr;
-+    return (b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) ||
-+           b[0] == 0xff;
++    static const uint8_t zero[12], nat64[12] = { 0, 0x64, 0xff, 0x9b };
++    const uint8_t *b;
++
++    if (addr->sa_family == AF_INET) {
++        return slirp_destination_class4(
++            (const uint8_t *)&((const struct sockaddr_in *)addr)->sin_addr);
++    }
++    if (addr->sa_family != AF_INET6) {
++        return SLIRP_DESTINATION_HOST;
++    }
++    b = ((const struct sockaddr_in6 *)addr)->sin6_addr.s6_addr;
++    if ((!memcmp(b, zero, 10) && b[10] == 0xff && b[11] == 0xff) ||  /* v4-mapped */
++        (!memcmp(b, zero, 8) && b[8] == 0xff && b[9] == 0xff &&
++         !b[10] && !b[11]) ||                                         /* v4-translated */
++        !memcmp(b, zero, 12) ||                       /* v4-compatible, :: and ::1 */
++        !memcmp(b, nat64, 12)) {
++        return slirp_destination_class4(b + 12);
++    }
++    if ((b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0x80)) || b[0] == 0xff) {
++        return SLIRP_DESTINATION_LOCAL;
++    }
++    return SLIRP_DESTINATION_PUBLIC;
++}
++
++/* The address an IPv6 one carries (as slirp_destination_class reads it), 4 or 16 bytes into `out`. */
++static size_t slirp_destination_bytes(const struct sockaddr *addr, uint8_t out[16])
++{
++    static const uint8_t zero[12], nat64[12] = { 0, 0x64, 0xff, 0x9b };
++    const uint8_t *b;
++
++    if (addr->sa_family == AF_INET) {
++        memcpy(out, &((const struct sockaddr_in *)addr)->sin_addr, 4);
++        return 4;
++    }
++    if (addr->sa_family != AF_INET6) {
++        return 0;
++    }
++    b = ((const struct sockaddr_in6 *)addr)->sin6_addr.s6_addr;
++    if ((!memcmp(b, zero, 10) && b[10] == 0xff && b[11] == 0xff) ||
++        (!memcmp(b, zero, 8) && b[8] == 0xff && b[9] == 0xff && !b[10] && !b[11]) ||
++        !memcmp(b, zero, 12) || !memcmp(b, nat64, 12)) {
++        memcpy(out, b + 12, 4);
++        return 4;
++    }
++    memcpy(out, b, 16);
++    return 16;
++}
++
++#ifndef _WIN32
++#include <ifaddrs.h>
++#endif
++
++/* One of the host's own interface addresses (read again at most every 5 s):
++ * its services listening on every interface are behind it, so an address
++ * that would otherwise be public is the local network. */
++static bool slirp_host_own_address(const struct sockaddr *addr)
++{
++#ifdef _WIN32
++    return false;
++#else
++    static uint8_t own[64][16];
++    static size_t own_len[64], own_count;
++    static int64_t read_at;
++    static bool have_read;
++    int64_t now = g_get_monotonic_time();
++    uint8_t want[16];
++    size_t len = slirp_destination_bytes(addr, want);
++
++    if (!have_read || now - read_at > 5 * G_USEC_PER_SEC) {
++        struct ifaddrs *list, *i;
++        own_count = 0;
++        if (getifaddrs(&list) == 0) {
++            for (i = list; i && own_count < 64; i = i->ifa_next) {
++                if (i->ifa_addr && (own_len[own_count] =
++                        slirp_destination_bytes(i->ifa_addr, own[own_count]))) {
++                    own_count++;
++                }
++            }
++            freeifaddrs(list);
++        }
++        read_at = now;
++        have_read = true;
++    }
++    for (size_t n = 0; len && n < own_count; n++) {
++        if (own_len[n] == len && !memcmp(own[n], want, len)) {
++            return true;
++        }
++    }
++    return false;
++#endif
++}
++
++bool slirp_destination_allowed(Slirp *slirp, const struct sockaddr *addr)
++{
++    int c = slirp_destination_class(addr);
++    if (c == SLIRP_DESTINATION_PUBLIC && slirp_host_own_address(addr)) {
++        c = SLIRP_DESTINATION_LOCAL;
++    }
++    return c == SLIRP_DESTINATION_PUBLIC ||
++           (c == SLIRP_DESTINATION_LOCAL && !slirp->local_network_blocked);
 +}
 +
  #define CONN_CANFSEND(so) \
      (((so)->so_state & (SS_FCANTSENDMORE | SS_ISFCONNECTED)) == SS_ISFCONNECTED)
  #define CONN_CANFRCV(so) \
 diff --git a/src/slirp.h b/src/slirp.h
-index 63330314..097b0b94 100644
+index 63330314..01e25bd8 100644
 --- a/src/slirp.h
 +++ b/src/slirp.h
 @@ -154,6 +154,8 @@ struct Slirp {
@@ -115,19 +244,18 @@ index 63330314..097b0b94 100644
      struct gfwd_list *guestfwd_list;
  
      int if_mtu;
-@@ -234,6 +236,10 @@ void if_start(Slirp *);
+@@ -234,6 +236,9 @@ void if_start(Slirp *);
  /* Get the IPv4 address and port of the DNS server on the host side */
  int get_dns_addr(struct in_addr *pdns_addr, uint16_t *pdns_port);
  
-+/* Local-network destinations, refused while local_network_blocked. */
-+bool slirp_local_network_addr4(struct in_addr a);
-+bool slirp_local_network_addr6(const struct in6_addr *a);
++/* slirp_destination_class allows `addr`: public, or local while not local_network_blocked. */
++bool slirp_destination_allowed(Slirp *slirp, const struct sockaddr *addr);
 +
  /* Get the IPv6 address and port of the DNS server on the host side */
  int get_dns6_addr(struct in6_addr *pdns6_addr, uint16_t *pdns_port,
                    uint32_t *scope_id);
 diff --git a/src/socket.c b/src/socket.c
-index 8ca61d74..b92c8ab8 100644
+index 8ca61d74..62545947 100644
 --- a/src/socket.c
 +++ b/src/socket.c
 @@ -976,6 +976,14 @@ void sofwdrain(struct socket *so)
@@ -155,36 +283,34 @@ index 8ca61d74..b92c8ab8 100644
          if (so->so_fport == htons(53) &&
                  get_dns6_addr(&sin->sin6_addr, &sin->sin6_port, &scope_id) >= 0) {
              sin->sin6_scope_id = scope_id;
-@@ -1019,14 +1030,26 @@ static bool sotranslate_out6(Slirp *s, struct socket *so, struct sockaddr_in6 *s
+@@ -1019,16 +1030,23 @@ static bool sotranslate_out6(Slirp *s, struct socket *so, struct sockaddr_in6 *s
  
  int sotranslate_out(struct socket *so, struct sockaddr_storage *addr)
  {
+-    bool ok = true;
 +    Slirp *s = so->slirp;
-     bool ok = true;
++    bool ok = true, dns = false;
  
      switch (addr->ss_family) {
      case AF_INET:
 -        ok = sotranslate_out4(so->slirp, so, (struct sockaddr_in *)addr);
++        dns = !s->disable_dns && so->so_faddr.s_addr == s->vnameserver_addr.s_addr;
 +        ok = sotranslate_out4(s, so, (struct sockaddr_in *)addr);
-+        /* The host's DNS server may sit on the LAN; that is the one exemption. */
-+        if (ok && s->local_network_blocked &&
-+            !(!s->disable_dns && so->so_faddr.s_addr == s->vnameserver_addr.s_addr) &&
-+            slirp_local_network_addr4(((struct sockaddr_in *)addr)->sin_addr)) {
-+            ok = false;
-+        }
          break;
      case AF_INET6:
 -        ok = sotranslate_out6(so->slirp, so, (struct sockaddr_in6 *)addr);
++        dns = !s->disable_dns && in6_equal(&so->so_faddr6, &s->vnameserver_addr6);
 +        ok = sotranslate_out6(s, so, (struct sockaddr_in6 *)addr);
-+        if (ok && s->local_network_blocked &&
-+            !(!s->disable_dns && in6_equal(&so->so_faddr6, &s->vnameserver_addr6)) &&
-+            slirp_local_network_addr6(&((struct sockaddr_in6 *)addr)->sin6_addr)) {
-+            ok = false;
-+        }
          break;
      }
++    /* The host's DNS server may sit on the LAN or loopback; that is the one exemption. */
++    if (ok && !dns && !slirp_destination_allowed(s, (struct sockaddr *)addr)) {
++        ok = false;
++    }
  
-@@ -1065,6 +1088,9 @@ void sotranslate_in(struct socket *so, struct sockaddr_storage *addr)
+     if (!ok) {
+         errno = EPERM;
+@@ -1065,6 +1083,9 @@ void sotranslate_in(struct socket *so, struct sockaddr_storage *addr)
                  sin->sin_port == dns_port &&
                  sin->sin_addr.s_addr == sin_addr.s_addr)
              sin->sin_port = htons(53);
