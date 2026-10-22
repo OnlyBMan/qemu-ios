@@ -334,10 +334,17 @@ static inline bool f64_is_inf(union_float64 a)
     return float64_is_infinity(a.s);
 }
 
+/* What float32/64_gen2 may keep in hardfloat beyond normal results. */
+enum gen2_exact {
+    GEN2_NONE,      /* only normal results */
+    GEN2_ADDSUB,    /* also exact zeros and NaN/infinity operands of an add or subtract */
+    GEN2_MUL,       /* the same for a multiply */
+};
+
 static inline float32
 float32_gen2(float32 xa, float32 xb, float_status *s,
              hard_f32_op2_fn hard, soft_f32_op2_fn soft,
-             f32_check_fn pre, f32_check_fn post)
+             f32_check_fn pre, f32_check_fn post, enum gen2_exact exact)
 {
     union_float32 ua, ub, ur;
 
@@ -345,22 +352,62 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
     ub.s = xb;
 
     if (unlikely(!can_use_fpu(s))) {
-        goto soft;
+        if (exact == GEN2_NONE || QEMU_NO_HARDFLOAT) {
+            goto soft;
+        }
+        float32_input_flush2(&ua.s, &ub.s, s);
+        goto special;
     }
 
     float32_input_flush2(&ua.s, &ub.s, s);
     if (unlikely(!pre(ua, ub))) {
-        goto soft;
+        goto special;
     }
 
     ur.h = hard(ua.h, ub.h);
     if (unlikely(f32_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
-    } else if (unlikely(fabsf(ur.h) <= FLT_MIN) && post(ua, ub)) {
-        goto soft;
+    } else if (unlikely(fabsf(ur.h) <= FLT_MIN)) {
+        /* Zero from a zero factor, or an exact cancellation: exact, no flags. */
+        if (exact != GEN2_NONE && float32_is_zero(ur.s) &&
+            (exact == GEN2_ADDSUB || float32_is_zero(ua.s) || float32_is_zero(ub.s))) {
+            return ur.s;
+        }
+        if (post(ua, ub)) {
+            goto soft;
+        }
     }
     return ur.s;
 
+ special:
+    /*
+     * A NaN or infinity operand with default NaN results: the result needs
+     * no rounding, so the host's is right whatever the inexact flag says.
+     * Arm's Advanced SIMD (standard FPSCR) works this way; a DSP stuck on
+     * NaNs (iOS 6's speaker protection) otherwise ran every op in software.
+     */
+    if (exact != GEN2_NONE && s->default_nan_mode) {
+        bool an = float32_is_any_nan(ua.s), bn = float32_is_any_nan(ub.s);
+        bool ai = float32_is_infinity(ua.s), bi = float32_is_infinity(ub.s);
+
+        if ((an || bn || ai || bi) &&
+            (an || ai || float32_is_zero_or_normal(ua.s)) &&
+            (bn || bi || float32_is_zero_or_normal(ub.s))) {
+            if (an || bn) {
+                if (float32_is_signaling_nan(ua.s, s) || float32_is_signaling_nan(ub.s, s)) {
+                    float_raise(float_flag_invalid | float_flag_invalid_snan, s);
+                }
+                return float32_default_nan(s);
+            }
+            ur.h = hard(ua.h, ub.h);
+            if (isnan(ur.h)) {     /* inf * 0, inf - inf */
+                float_raise(float_flag_invalid | (exact == GEN2_MUL ? float_flag_invalid_imz
+                                                                    : float_flag_invalid_isi), s);
+                return float32_default_nan(s);
+            }
+            return ur.s;
+        }
+    }
  soft:
     return soft(ua.s, ub.s, s);
 }
@@ -368,7 +415,7 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
 static inline float64
 float64_gen2(float64 xa, float64 xb, float_status *s,
              hard_f64_op2_fn hard, soft_f64_op2_fn soft,
-             f64_check_fn pre, f64_check_fn post)
+             f64_check_fn pre, f64_check_fn post, enum gen2_exact exact)
 {
     union_float64 ua, ub, ur;
 
@@ -376,22 +423,62 @@ float64_gen2(float64 xa, float64 xb, float_status *s,
     ub.s = xb;
 
     if (unlikely(!can_use_fpu(s))) {
-        goto soft;
+        if (exact == GEN2_NONE || QEMU_NO_HARDFLOAT) {
+            goto soft;
+        }
+        float64_input_flush2(&ua.s, &ub.s, s);
+        goto special;
     }
 
     float64_input_flush2(&ua.s, &ub.s, s);
     if (unlikely(!pre(ua, ub))) {
-        goto soft;
+        goto special;
     }
 
     ur.h = hard(ua.h, ub.h);
     if (unlikely(f64_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
-    } else if (unlikely(fabs(ur.h) <= DBL_MIN) && post(ua, ub)) {
-        goto soft;
+    } else if (unlikely(fabs(ur.h) <= DBL_MIN)) {
+        /* Zero from a zero factor, or an exact cancellation: exact, no flags. */
+        if (exact != GEN2_NONE && float64_is_zero(ur.s) &&
+            (exact == GEN2_ADDSUB || float64_is_zero(ua.s) || float64_is_zero(ub.s))) {
+            return ur.s;
+        }
+        if (post(ua, ub)) {
+            goto soft;
+        }
     }
     return ur.s;
 
+ special:
+    /*
+     * A NaN or infinity operand with default NaN results: the result needs
+     * no rounding, so the host's is right whatever the inexact flag says.
+     * Arm's Advanced SIMD (standard FPSCR) works this way; a DSP stuck on
+     * NaNs (iOS 6's speaker protection) otherwise ran every op in software.
+     */
+    if (exact != GEN2_NONE && s->default_nan_mode) {
+        bool an = float64_is_any_nan(ua.s), bn = float64_is_any_nan(ub.s);
+        bool ai = float64_is_infinity(ua.s), bi = float64_is_infinity(ub.s);
+
+        if ((an || bn || ai || bi) &&
+            (an || ai || float64_is_zero_or_normal(ua.s)) &&
+            (bn || bi || float64_is_zero_or_normal(ub.s))) {
+            if (an || bn) {
+                if (float64_is_signaling_nan(ua.s, s) || float64_is_signaling_nan(ub.s, s)) {
+                    float_raise(float_flag_invalid | float_flag_invalid_snan, s);
+                }
+                return float64_default_nan(s);
+            }
+            ur.h = hard(ua.h, ub.h);
+            if (isnan(ur.h)) {     /* inf * 0, inf - inf */
+                float_raise(float_flag_invalid | (exact == GEN2_MUL ? float_flag_invalid_imz
+                                                                    : float_flag_invalid_isi), s);
+                return float64_default_nan(s);
+            }
+            return ur.s;
+        }
+    }
  soft:
     return soft(ua.s, ub.s, s);
 }
@@ -2087,14 +2174,14 @@ static float32 float32_addsub(float32 a, float32 b, float_status *s,
                               hard_f32_op2_fn hard, soft_f32_op2_fn soft)
 {
     return float32_gen2(a, b, s, hard, soft,
-                        f32_is_zon2, f32_addsubmul_post);
+                        f32_is_zon2, f32_addsubmul_post, GEN2_ADDSUB);
 }
 
 static float64 float64_addsub(float64 a, float64 b, float_status *s,
                               hard_f64_op2_fn hard, soft_f64_op2_fn soft)
 {
     return float64_gen2(a, b, s, hard, soft,
-                        f64_is_zon2, f64_addsubmul_post);
+                        f64_is_zon2, f64_addsubmul_post, GEN2_ADDSUB);
 }
 
 float32 QEMU_FLATTEN
@@ -2264,14 +2351,14 @@ float32 QEMU_FLATTEN
 float32_mul(float32 a, float32 b, float_status *s)
 {
     return float32_gen2(a, b, s, hard_f32_mul, soft_f32_mul,
-                        f32_is_zon2, f32_addsubmul_post);
+                        f32_is_zon2, f32_addsubmul_post, GEN2_MUL);
 }
 
 float64 QEMU_FLATTEN
 float64_mul(float64 a, float64 b, float_status *s)
 {
     return float64_gen2(a, b, s, hard_f64_mul, soft_f64_mul,
-                        f64_is_zon2, f64_addsubmul_post);
+                        f64_is_zon2, f64_addsubmul_post, GEN2_MUL);
 }
 
 float64 float64r32_mul(float64 a, float64 b, float_status *status)
@@ -2672,14 +2759,14 @@ float32 QEMU_FLATTEN
 float32_div(float32 a, float32 b, float_status *s)
 {
     return float32_gen2(a, b, s, hard_f32_div, soft_f32_div,
-                        f32_div_pre, f32_div_post);
+                        f32_div_pre, f32_div_post, GEN2_NONE);
 }
 
 float64 QEMU_FLATTEN
 float64_div(float64 a, float64 b, float_status *s)
 {
     return float64_gen2(a, b, s, hard_f64_div, soft_f64_div,
-                        f64_div_pre, f64_div_post);
+                        f64_div_pre, f64_div_post, GEN2_NONE);
 }
 
 float64 float64r32_div(float64 a, float64 b, float_status *status)

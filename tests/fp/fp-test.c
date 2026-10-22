@@ -104,6 +104,8 @@ static const char commands_string[] =
     " -e = max error count per test. Default: 20. Set no limit with 0\n"
     " -f = initial FP exception flags (vioux). Default: none\n"
     " -l = thoroughness level (1 (default), 2)\n"
+    " -n = default NaN mode (Arm's FPSCR.DN): every NaN result of a\n"
+    "      two-operand f16/f32/f64 operation must be the default NaN\n"
     " -r = rounding mode (even (default), zero, down, up, tieaway, odd)\n"
     "      Set to 'all' to test all rounding modes, if applicable\n"
     " -s = stop when a test fails\n"
@@ -840,7 +842,7 @@ static void parse_args(int argc, char *argv[])
     int c;
 
     for (;;) {
-        c = getopt(argc, argv, "he:f:l:r:sq");
+        c = getopt(argc, argv, "he:f:l:nr:sq");
         if (c < 0) {
             break;
         }
@@ -865,6 +867,9 @@ static void parse_args(int argc, char *argv[])
                 fprintf(stderr, "fatal: invalid test level\n");
                 exit(EXIT_FAILURE);
             }
+            break;
+        case 'n':
+            qsf.default_nan_mode = true;
             break;
         case 'r':
             if (!strcmp(optarg, "all")) {

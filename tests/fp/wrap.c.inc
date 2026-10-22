@@ -467,6 +467,15 @@ static void qemu_f128M_roundToInt(const float128_t *ap, uint_fast8_t round,
         type ret;                                       \
                                                         \
         ret = func(*ap, *bp, &qsf);                     \
+        /* -n: testfloat takes any NaN for a NaN */     \
+        if (qsf.default_nan_mode && type##_is_any_nan(ret) && \
+            type##_val(ret) !=                          \
+            type##_val(type##_default_nan(&qsf))) {     \
+            fprintf(stderr, "%s: NaN 0x%" PRIx64        \
+                    " is not the default NaN\n",        \
+                    #func, (uint64_t)type##_val(ret));  \
+            exit(EXIT_FAILURE);                         \
+        }                                               \
         return *(type##_t *)&ret;                       \
     }
 

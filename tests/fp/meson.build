@@ -131,6 +131,17 @@ foreach k, v : softfloat_tests
        suite: ['softfloat', 'softfloat-' + v])
 endforeach
 
+# Default NaN mode (Arm's FPSCR.DN, and Advanced SIMD's standard FPSCR), where
+# hardfloat also takes NaN and infinity operands; -f x starts with inexact set,
+# as a guest's flags are after its first rounding, so hardfloat runs at all.
+foreach k, f : {'': [], '-inexact': ['-f', 'x']}
+  test('fp-test-dn' + k, fptest,
+       args: fptest_args + fptest_rounding_args + ['-n'] + f +
+             ['f16_add', 'f16_sub', 'f16_mul', 'f32_add', 'f32_sub', 'f32_mul',
+              'f64_add', 'f64_sub', 'f64_mul'],
+       suite: ['softfloat', 'softfloat-ops'])
+endforeach
+
 # FIXME: extF80_{mulAdd} (missing)
 test('fp-test-mulAdd', fptest,
      # no fptest_rounding_args
