@@ -101,6 +101,7 @@ struct S5L8930DisplayState {
     qemu_irq clcd_irq;
     QemuConsole *con;
     QEMUTimer *vbl;
+    int64_t next_vbl;        /* the VBL's deadline, QEMU_CLOCK_VIRTUAL */
     uint64_t fb_base;        /* property: seed iBoot's scanout when nonzero */
     uint16_t width, height;  /* properties: the board's panel, as iBoot programs it */
     uint32_t pw, ph;         /* "panel-width"/"panel-height": panel= override (issue #21), 0 = the board's */
@@ -309,6 +310,24 @@ static void pipe_frame_end(DisplayPipe *p)
     pipe_update_irq(p);
 }
 
+/*
+ * The next VBL, a period after the last deadline, as the panel's timing generator runs. Re-arming from the
+ * time the tick finished added its own work (the latch, the console update) and any timer lateness to every
+ * frame, and the panel ran at about 50 Hz.
+ */
+static void vbl_rearm(S5L8930DisplayState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->next_vbl += VBL_PERIOD_NS(s);
+    if (s->next_vbl <= now) {
+        /* A whole frame behind (paused, descheduled, just loaded): resynchronize
+         * rather than hand the guest a burst of VBLs. */
+        s->next_vbl = now + VBL_PERIOD_NS(s);
+    }
+    timer_mod(s->vbl, s->next_vbl);
+}
+
 /* One frame: the queued swaps complete and the VBLs fire. */
 static void vbl_tick(void *opaque)
 {
@@ -359,7 +378,7 @@ static void vbl_tick(void *opaque)
                 s->pipe[i].regs[DP_IRQ_STATUS / 4] |= DP_IRQ_VBL;
                 pipe_update_irq(&s->pipe[i]);
             }
-            timer_mod(s->vbl, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s));
+            vbl_rearm(s);
             return;
         }
     }
@@ -403,7 +422,7 @@ static void vbl_tick(void *opaque)
     /* ponytail: the frame is the only CLCD source raised, the one AppleCLCD enables (its LUT and dither updates). */
     s->clcd_status |= CLCD_IRQ_FRAME;
     clcd_update_irq(s);
-    timer_mod(s->vbl, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s));
+    vbl_rearm(s);
 }
 
 /* ---- CLCD timing generator ---------------------------------------------- */
@@ -1052,7 +1071,8 @@ static void s5l8930_display_reset(DeviceState *dev)
         r[(DP_UI_BASE(0) + DP_UI_SRC_END) / 4] = s->width << 16 | s->height;
     }
     pipes_update_irq(s);
-    timer_mod(s->vbl, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s));
+    s->next_vbl = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s);
+    timer_mod(s->vbl, s->next_vbl);
 }
 
 static void s5l8930_display_realize(DeviceState *dev, Error **errp)
