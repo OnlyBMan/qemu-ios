@@ -610,14 +610,29 @@ void pmu_op_finish(CPUARMState *env)
     }
 }
 
+/*
+ * With PMCR.E clear and no EL2 (whose MDCR_EL2.HPME could enable counters
+ * of its own), nothing counts at any EL: an EL change only rewrites deltas
+ * that the PMCR write enabling the PMU sets again. iOS takes ~10K exceptions
+ * a second with the PMU off, each reading the clock in these hooks.
+ */
+static bool pmu_counting_off(CPUARMState *env)
+{
+    return !arm_feature(env, ARM_FEATURE_EL2) && !(env->cp15.c9_pmcr & PMCRE);
+}
+
 void pmu_pre_el_change(ARMCPU *cpu, void *ignored)
 {
-    pmu_op_start(&cpu->env);
+    if (!pmu_counting_off(&cpu->env)) {
+        pmu_op_start(&cpu->env);
+    }
 }
 
 void pmu_post_el_change(ARMCPU *cpu, void *ignored)
 {
-    pmu_op_finish(&cpu->env);
+    if (!pmu_counting_off(&cpu->env)) {
+        pmu_op_finish(&cpu->env);
+    }
 }
 
 static void pmu_timer_work(CPUState *cs, run_on_cpu_data data)
