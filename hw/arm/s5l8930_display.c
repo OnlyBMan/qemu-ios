@@ -964,10 +964,16 @@ static void display_update(void *opaque)
         return;
     }
 
-    /* The frame completed by the last swap, if it still describes these
-     * layers; the live buffers only before the first swap (iBoot, early boot). */
+    /*
+     * The frame completed by the last swap, while it has these layers at this size; the live buffers only
+     * before the first latch (iBoot, early boot) or when a layer turned on or off without a swap. Not the
+     * layers' bases (key[2..3]): CA double-buffers UI1, so once a swap latches, the next one is queued with
+     * the other buffer's base, and matching the bases sent every QEMU display refresh (30 ms) through a live
+     * compose of both layers with the BQL held. The next VBL latches whatever the queued swap shows, and a
+     * panel a quarter second without a swap relatches its buffers every VBL (QUIET_RELATCH_VBLS).
+     */
     lit = compose(s, w, h, NULL, key);
-    if (lit && s->front_valid && !memcmp(key, s->front_key, sizeof(key))) {
+    if (lit && s->front_valid && !memcmp(key, s->front_key, 2 * sizeof(key[0]))) {
         img = (const uint32_t *)s->front;
         if (s->shown == 1 && s->shown_gen == s->front_gen && s->shown_surface == surface) {
             return;     /* the surface already holds this latched frame */
