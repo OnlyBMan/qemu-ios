@@ -109,6 +109,26 @@ int main(void) {
     assert(fetches==1); /* Reject before touching a guest pointer. */
     assert(gles_pvrtc_upload(NULL,GL_TEXTURE_3D,0,PVRTC_RGBA_4BPP,8,8,0,32,1,false)==-1);
     expect_error(GL_INVALID_ENUM);
+    /* A cube map's six faces (Epic Citadel's environment map): each takes its own picture and its own charge;
+     * replacing part of a face is refused, as only 2D levels are tracked. */
+    GLuint cube;glGenTextures(1,&cube);glBindTexture(GL_TEXTURE_CUBE_MAP,cube);
+    uint8_t faces[6][8*8*4],face_px[8*8*4];uint64_t held=gles_held_bytes;
+    for(unsigned f=0;f<6;f++) {
+        words(4);for(unsigned i=0;i<4;i++) {uint32_t c=0x80008000u|(f*5u)<<10|(31u-f*5u)<<5|(f*5u)<<21;memcpy(guest+8*i+4,&c,4);}
+        assert(!gles_pvrtc_upload(NULL,GL_TEXTURE_CUBE_MAP_POSITIVE_X+f,0,PVRTC_RGBA_4BPP,8,8,0,32,1,false));
+        memcpy(faces[f],decoded,sizeof(faces[f]));
+        assert(!f || memcmp(faces[f],faces[f-1],sizeof(faces[f])));
+    }
+    assert(gles_held_bytes-held==6*8*8*4);
+    for(unsigned f=0;f<6;f++) {
+        glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X+f,0,GL_RGBA,GL_UNSIGNED_BYTE,face_px);
+        assert(!memcmp(face_px,faces[f],sizeof(face_px)));
+    }
+    assert(gles_pvrtc_upload(NULL,GL_TEXTURE_CUBE_MAP_NEGATIVE_Z,0,PVRTC_RGBA_4BPP,8,8,0,32,1,true)==-1);
+    expect_error(GL_INVALID_ENUM);
+    assert(gles_pvrtc_upload(NULL,GL_TEXTURE_CUBE_MAP,0,PVRTC_RGBA_4BPP,8,8,0,32,1,false)==-1);
+    expect_error(GL_INVALID_ENUM);
+    glDeleteTextures(1,&cube);glBindTexture(GL_TEXTURE_2D,texture);
     uint32_t a[]={GL_TEXTURE_2D,0,0,0,8,8,PVRTC_RGBA_4BPP,32,1};
     assert(!dispatch(1,a));a[2]=1;assert(dispatch(1,a)==-1);expect_error(GL_INVALID_OPERATION);a[2]=0;
     a[4]=4;assert(dispatch(1,a)==-1);expect_error(GL_INVALID_OPERATION);a[4]=8;

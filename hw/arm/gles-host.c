@@ -4234,7 +4234,10 @@ static int64_t gles_pvrtc_upload(CPUState *cpu, uint32_t target, uint32_t level,
                                 uint32_t border, uint32_t size, uint32_t data,
                                 bool replace)
 {
-    if (target != GL_TEXTURE_2D) {
+    /* A cube map's faces decode like a 2D level (Epic Citadel's environment map). A replace checks the level
+     * it overwrites, which is tracked only for 2D textures. */
+    bool face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+    if (target != GL_TEXTURE_2D && !(face && !replace)) {
         gles_refuse("pvrtc:target:0x%x", target);
         gles_debug_texture(target);
         return gles_reject(GL_INVALID_ENUM);

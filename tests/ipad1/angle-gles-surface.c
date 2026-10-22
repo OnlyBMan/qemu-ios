@@ -1,7 +1,8 @@
 /* The GL bridge built for ANGLE, against real ANGLE Metal contexts: a sampled surface refreshes from guest memory
  * in an ES 2.0 context as in an ES1 one, the bridge's own checks of a draw raise no GL error in either, and a
  * surface bound at GL_TEXTURE_RECTANGLE (2.x and 3.x CoreAnimation's) samples by texel, takes rendering and is
- * charged to itself, a video frame's NV12 surface converts, and an RGB PVRTC texture uploads.
+ * charged to itself, a video frame's NV12 surface converts, an RGB PVRTC texture uploads, and so do a PVRTC cube
+ * map's six faces.
  * Run by tests/ipad1/angle-slice.sh.
  *
  * SLICE:gles-prelude hw/arm/gles-host.c range #include <TargetConditionals.h> | /* Old guest engines retain
@@ -279,11 +280,36 @@ static void pvrtc_rgb(void)
     CGLReleaseContext(c);
 }
 
+/* A PVRTC cube map (Epic Citadel's environment map, in an ES 2.0 context; and in an ES1 one): each face uploads and is
+ * charged on its own. */
+static void pvrtc_cube(bool es2)
+{
+    GLESAngleContextRef c;
+    GLuint tex;
+    uint64_t held = gles_held_bytes;
+
+    memset(&gh, 0, sizeof(gh));
+    assert(gles_angle_create(NULL, es2, &c) && !CGLSetCurrentContext(c));
+    gh.cgl = c;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+    for (unsigned f = 0; f < 6; f++) {
+        assert(!gles_pvrtc_upload(NULL, GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, PVRTC_RGBA_4BPP, 8, 8, 0, 32, 0, false));
+    }
+    assert(gles_held_bytes - held == 6 * 8 * 8 * 4);
+    assert(glGetError() == GL_NO_ERROR && !gh.error && !gles_rejects);
+    gles_charge_free(gh.charged);
+    CGLSetCurrentContext(NULL);
+    CGLReleaseContext(c);
+}
+
 int main(void)
 {
     rectangle();
     nv12();
     pvrtc_rgb();
+    pvrtc_cube(true);
+    pvrtc_cube(false);
     refresh(false);
     refresh(true);
     check_draw(true);           /* first: gles_check_texcoords warns once */
