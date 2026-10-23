@@ -29,7 +29,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 # Our device models and guest-facing host code. The GL bridge (gles-host*.c, guest-gles.c)
 # validates through its own fetch helpers and is checked by its own tests.
 SCOPE = [
-    "hw/arm/ipod_touch_*.c", "hw/arm/s5l89*.c", "hw/arm/ipad1.c", "hw/arm/ipod-agent.c",
+    "hw/arm/ipod_touch_*.c", "hw/arm/s5l89*.c", "hw/arm/ipad1.c", "hw/arm/iphone4s.c", "hw/arm/ipod-agent.c",
     "hw/arm/guest-services.c", "hw/arm/guest-pasteboard.c", "hw/arm/guest-package.c",
     "hw/arm/mrvl8686.c", "hw/arm/nand-image.c", "hw/arm/it_iboot.c", "hw/arm/tsl2561.c",
     "hw/arm/ipod_video.c", "hw/misc/ios_*.c", "hw/i2c/ipod_touch_i2c.c", "hw/intc/pl192.c",

@@ -78,6 +78,10 @@ static uint8_t cs42l58_recv(I2CSlave *i2c)
         res |= CS42L59_PDN_DONE;
     }
 
+    /* 10B329 AppleCS42L63Audio waits for PDN_DONE in register 0x62 bit 7. */
+    if (s->cs42l63 && reg == 0x62 && (s->regs[6] & 1)) {
+        res |= 0x80;
+    }
     if (codec_trace()) {
         TRACE_PRINTF(trace_cs42l58_log, "CODEC R %02x -> %02x\n", reg, res);
     }
@@ -101,7 +105,7 @@ static int cs42l58_send(I2CSlave *i2c, uint8_t data)
     if (codec_trace()) {
         TRACE_PRINTF(trace_cs42l58_log, "CODEC W %02x <- %02x\n", (uint8_t)(s->cmd & 0x7f), data);
     }
-    if ((s->cmd & 0x7f) != CS42L58_REG_CHIPID) {
+    if ((s->cmd & 0x7f) != (s->cs42l63 ? 5 : CS42L58_REG_CHIPID)) {
         s->regs[s->cmd & 0x7f] = data;
         if ((s->cmd & 0x7f) == s->rate_reg) {
             unsigned rate = cs42l58_sample_rate(data);
@@ -126,7 +130,11 @@ static void cs42l58_reset(DeviceState *dev)
     s->have_cmd = false;
     s->autoinc = false;
     /* Chip ID / revision: read-only on the real part. */
-    s->regs[CS42L58_REG_CHIPID] = id ? (uint8_t)strtoul(id, NULL, 0) : 0xe0;
+    if (s->cs42l63) {
+        s->regs[5] = 1;
+    } else {
+        s->regs[CS42L58_REG_CHIPID] = id ? (uint8_t)strtoul(id, NULL, 0) : 0xe0;
+    }
 }
 
 static void cs42l58_init(Object *obj)
@@ -182,10 +190,24 @@ static const TypeInfo cs42l59_info = {
     .instance_init = cs42l59_init,
 };
 
+static void cs42l63_init(Object *obj)
+{
+    CS42L58(obj)->cs42l63 = true;
+    /* PCM timing is not modeled by this control-only variant. */
+    CS42L58(obj)->rate_reg = 0xff;
+}
+
+static const TypeInfo cs42l63_info = {
+    .name = TYPE_CS42L63,
+    .parent = TYPE_CS42L58,
+    .instance_init = cs42l63_init,
+};
+
 static void cs42l58_register_types(void)
 {
     type_register_static(&cs42l58_info);
     type_register_static(&cs42l59_info);
+    type_register_static(&cs42l63_info);
 }
 
 type_init(cs42l58_register_types)

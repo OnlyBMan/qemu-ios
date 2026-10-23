@@ -27,6 +27,7 @@ typedef enum {
 void ipod_touch_press_button(IPodTouchButton button, bool down);
 /* The iPad 1's buttons (GPIO pins), same contract; no-op on other machines. */
 void ipad1_press_button(IPodTouchButton button, bool down);
+void iphone4s_press_button(IPodTouchButton button, bool down);
 /* The iPod touch 1G's (GPIO pads 0x16), home and power only; no-op on other machines. */
 void ipod_touch_1g_press_button(IPodTouchButton button, bool down);
 /* The S5L8920 boards' (-M n18, n88) GPIO buttons; no-op on other machines. */

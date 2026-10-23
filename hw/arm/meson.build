@@ -167,3 +167,5 @@ endif
 
 hw_arch += {'arm': arm_ss}
 hw_common_arch += {'arm': arm_common_ss}
+
+arm_ss.add(when: 'CONFIG_IPAD1', if_true: files('iphone4s.c', 's5l8940_aic.c', 's5l8940_i2c.c', 's5l8940_pmu.c'))

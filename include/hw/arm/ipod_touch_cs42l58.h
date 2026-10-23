@@ -10,6 +10,7 @@
 #include "hw/core/qdev-clock.h"
 
 #define TYPE_CS42L58                 "cs42l58"
+#define TYPE_CS42L63                 "cs42l63"   /* A5 control register map, power-down status in 0x62 */
 #define TYPE_CS42L59                 "cs42l59"   /* + power-down status, rate in 0x0a */
 OBJECT_DECLARE_SIMPLE_TYPE(CS42L58State, CS42L58)
 
@@ -19,6 +20,7 @@ typedef struct CS42L58State {
 	bool have_cmd;
 	bool autoinc;
 	uint8_t regs[128];
+	bool cs42l63;
 	bool pdn_status;     /* CS42L59: 0x38 bit 3 reports power-down done */
 	uint8_t rate_reg;    /* the register whose low five bits select LRCLK */
 	Clock *lrclk;

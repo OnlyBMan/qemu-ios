@@ -33,7 +33,7 @@ typedef struct {
 } IPodTouchI2SState;
 typedef struct {
     unsigned cmd;
-    bool have_cmd, autoinc;
+    bool have_cmd, autoinc, cs42l63;
     uint8_t regs[128];
     uint8_t rate_reg;
     Clock *lrclk;

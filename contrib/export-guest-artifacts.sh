@@ -82,7 +82,7 @@ for p in it-instprogress/sbdlicon it-halt/ithalt it-agent/it_agent it-agent/it_t
     stage guest-tools "$C/$p"
 done
 # The iPad set, by the file names firmwarekit reads (SystemEdits.Helpers, Preparer's it_keybag).
-for t in it_pbd it_prefs it_msmquiet.dylib it_seal it_keybag it_gltest; do
+for t in it_pbd it_prefs it_msmquiet.dylib it_seal it_keybag it_n94seed it_gltest; do
     stage ipad-guest-tools "$G/ipad1-guest/$t"
 done
 # armv7 on 3.0 (dyld without LC_DYLD_INFO_ONLY): the same, legacy-linked, as <name>-legacy (SystemEdits picks them)

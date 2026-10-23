@@ -321,4 +321,9 @@ typedef struct A4DTEdit {
 void a4_dt_edit(uint8_t *image, size_t image_len, uint32_t load_pa,
                 uint32_t bootargs_pa, const A4DTEdit *e);
 
+
+void s5l8940_d1881_button(DeviceState *dev, bool hold, bool down);
+bool s5l8940_d1881_take_suspend(DeviceState *dev);
+bool s5l8940_d1881_guest_shutdown_confirmed(void);
+
 #endif

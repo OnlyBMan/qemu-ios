@@ -51,7 +51,7 @@ typedef struct {
     unsigned cmd;
     bool have_cmd, autoinc;
     uint8_t regs[128];
-    bool pdn_status;
+    bool pdn_status, cs42l63;
     uint8_t rate_reg;
     Clock *lrclk;
 } CS42L58State;

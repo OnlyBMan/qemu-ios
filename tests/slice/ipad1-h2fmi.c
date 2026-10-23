@@ -24,7 +24,7 @@
  * so every write of 3 re-transfers the page (the phantom transfer).
  *
  * SLICE hw/arm/s5l8930_h2fmi.c range #define H2FMI_BUSES | #define HT(
- * SLICE hw/arm/s5l8930_h2fmi.c fn h2fmi_format h2fmi_status h2fmi_update_irq h2fmi_ce h2fmi_fmc_events h2fmi_command h2fmi_go fifo_compact h2fmi_raw_read h2fmi_read_bytes h2fmi_room h2fmi_transfer h2fmi_meta_per_page h2fmi_write_check h2fmi_drain fifo_pop h2fmi_ecc_sector h2fmi_read h2fmi_write
+ * SLICE hw/arm/s5l8930_h2fmi.c fn h2fmi_format h2fmi_status h2fmi_update_irq h2fmi_ce h2fmi_fmc_events h2fmi_ppn_load h2fmi_command h2fmi_go fifo_compact h2fmi_raw_read h2fmi_read_bytes h2fmi_room h2fmi_transfer h2fmi_meta_per_page h2fmi_write_check h2fmi_drain fifo_pop h2fmi_ecc_sector h2fmi_seq_pop h2fmi_seq_advance h2fmi_seq_run h2fmi_seq_command h2fmi_read h2fmi_write
  */
 #include <assert.h>
 #define trace_event_get_state_backends(id) 0
@@ -64,7 +64,7 @@ void s5l8930_iop_nand_info(DeviceState *d, uint32_t *id, uint8_t *m, uint32_t *p
 bool s5l8930_iop_nand_read(DeviceState *d, int bus, uint32_t ce, uint32_t page,
                            uint8_t *buf, uint32_t *stride) {
     (void)d; (void)bus; (void)ce; (void)page;
-    for (int i = 0; i < 64; i++) buf[i] = (uint8_t)i;
+    for (unsigned i = 0; i < g_page_bytes + 64; i++) buf[i] = (uint8_t)i;
     *stride = g_page_bytes + 16;
     return true;
 }
@@ -79,6 +79,9 @@ uint32_t s5l8930_iop_nand_erase(DeviceState *d, int bus, uint32_t ce, uint32_t p
 }
 void s5l8930_cdma_kick(DeviceState *d) { (void)d; }
 void s5l8930_cdma_sink_done(DeviceState *d, uint32_t base, uint32_t size) { (void)d; (void)base; (void)size; }
+typedef struct H2FMIBus H2FMIBus;
+static void h2fmi_transfer(H2FMIBus *b, int ce, bool queued);
+static void h2fmi_write(void *opaque, hwaddr off, uint64_t val, unsigned size);
 #include "slice.h"
 
 struct DeviceState { int unused; };
@@ -170,6 +173,91 @@ int main(void) {
     h2fmi_write(ip, isp->fmc_off + FMC_GO, 0x50, 4);          /* the status byte */
     assert(ip->fmc[FMC_NAND_STATUS / 4] & 0x80);              /* not write-protected */
 
+    /* N94: the PPN controller owns ECC, queues reads, and transfers complete 8 KiB pages + 32 metadata bytes. */
+    S5L8930H2FMIState *ps = calloc(1, sizeof *ps);
+    H2FMIBus *pp = calloc(1, sizeof *pp);
+    ps->ppn = true; ps->iop = &iop; ps->fmc_off = 0x40000; ps->ecc_off = 0x80000; pp->s = ps;
+    g_page_bytes = 8192;
+    h2fmi_write(pp, 0x4000c, 1, 4);
+    h2fmi_write(pp, FMI_FORMAT, 0x20840004, 4);
+    h2fmi_write(pp, FMI_CONTROL, 0x1302, 4);
+    for (unsigned block = 0x80f; block >= 0x80e; block--) {
+        h2fmi_write(pp, 0x40020, 6, 4);
+        h2fmi_write(pp, 0x40018, 0x2020, 4);
+        h2fmi_write(pp, 0x4001c, 0x200000 | block << 8, 4);
+        h2fmi_write(pp, 0x40014, 0x370a, 4);
+        h2fmi_write(pp, 0x40010, 0xb, 4);
+    }
+    assert(pp->ppn_read_n[0] == 2);
+    h2fmi_write(pp, 0x40014, 0x7a, 4);
+    h2fmi_write(pp, 0x40010, 1, 4);
+    assert(pp->page_row[0] == PPN_BOOT_BASE + 0x80f00 && pp->ppn_read_n[0] == 1);
+    assert(pp->data_len == 0); /* NAND read command latches; sequencer frames perform the DMA. */
+    h2fmi_write(pp, 0xc0000, 0x0b000000, 4);
+    assert(pp->data_len == 4096 && pp->meta_len == 16 && pp->ecc_n == 0);
+    h2fmi_write(pp, 0xc0000, 0x0b000000, 4);
+    assert(pp->page_row[0] == PPN_BOOT_BASE + 0x80f00 && pp->ppn_read_n[0] == 1);
+    assert(pp->data_len == 8192 && pp->meta_len == 32 && pp->ecc_n == 0);
+    h2fmi_write(pp, 0xc0000, 0x0b000000, 4);
+    h2fmi_write(pp, 0xc0000, 0x0b000000, 4);
+    assert(pp->page_row[0] == PPN_BOOT_BASE + 0x80e00 && pp->ppn_read_n[0] == 0);
+    assert(pp->data_len == 16384 && pp->meta_len == 64 && pp->ecc_n == 0);
+
+    /* Address-list preflight must not become the first page's payload. */
+    pp->wdata_len = 16;
+    memset(pp->wdata, 0x99, 16);
+    h2fmi_command(pp, 0xb0);
+    h2fmi_command(pp, 0xb8);
+    assert(pp->wdata_len == 0 && pp->wmeta_len == 0);
+
+    /* A queued burst programs one physical page per confirm, including intermediate 0x87 pages. */
+    pp->wdata_len = 16384; pp->wmeta_len = 64;
+    memset(pp->wdata, 0xaa, 8192); memset(pp->wdata + 8192, 0xbb, 8192);
+    memset(pp->wmeta, 0x20, 64);
+    for (unsigned page = 0; page < 2; page++) {
+        h2fmi_write(pp, 0x40020, 2, 4);
+        h2fmi_write(pp, 0x40018, 0x280f00 + page, 4);
+        h2fmi_write(pp, 0x40014, page ? 0x8a : 0x87, 4);
+        h2fmi_write(pp, 0x40010, 9, 4);
+        h2fmi_write(pp, 0x40014, 0x17, 4);
+        h2fmi_write(pp, 0x40010, 1, 4);
+        assert(g_prog.len == 8192 && g_prog.page == PPN_BOOT_BASE + 0x80f00 + page);
+        assert(g_prog.data[0] == (page ? 0xbb : 0xaa));
+    }
+    assert(pp->wdata_len == 0 && pp->wmeta_len == 0);
+
+    /* Sequencer operand FIFO and completion status are independent. */
+    h2fmi_write(pp, 0xc1000, 0x10040018, 4);
+    h2fmi_write(pp, 0xc1004, 0x0d000000, 4);
+    h2fmi_write(pp, 0xc0014, 0xdeadbeef, 4);
+    h2fmi_write(pp, 0xc0000, 0x11000002, 4);
+    assert(pp->fmc[FMC_ADDR0 / 4] == 0xdeadbeef && pp->seq_operand_n == 0);
+    assert(h2fmi_read(pp, 0xc0020, 4) == 1);
+    h2fmi_write(pp, 0xc0020, 1, 4);
+    assert(h2fmi_read(pp, 0xc0020, 4) == 0);
+    h2fmi_write(pp, 0xc0000, 0x10040018, 4);
+    assert(pp->seq_command_n == 1); /* waits for the operand, rather than consuming zero */
+    h2fmi_write(pp, 0xc0014, 0x12345678, 4);
+    assert(pp->seq_command_n == 0 && pp->fmc[FMC_ADDR0 / 4] == 0x12345678);
+    h2fmi_write(pp, 0xc0000, 0x0f000034, 4);
+    assert(pp->seq_command_n == 1); /* immediate arrives in the command FIFO */
+    h2fmi_write(pp, 0xc0000, 0x1001, 4);
+    assert(pp->fmi[FMI_FORMAT / 4] == 0x1001 && pp->seq_command_n == 0);
+    /* Restoring PPN power features after hibernate uses PIO, not page DMA. */
+    h2fmi_write(pp, 4, 6, 4);
+    h2fmi_write(pp, 0x40014, 0xef, 4);
+    h2fmi_write(pp, 0x40010, 1, 4);
+    h2fmi_write(pp, 0x34, 0x401, 4);
+    h2fmi_write(pp, 4, 5, 4);
+    assert(h2fmi_read(pp, 0x1c, 4) & 0x18);
+    assert(!(h2fmi_read(pp, 0xc, 4) & FMI_ST_DONE));
+    h2fmi_write(pp, 0x14, 0x12345678, 4);
+    assert(h2fmi_read(pp, 0xc, 4) & FMI_ST_DONE);
+    assert(!(h2fmi_read(pp, 0x1c, 4) & 0x18));
+    assert(pp->wdata_len == 4 && pp->wdata[0] == 0x78);
+    h2fmi_command(pp, 0xe7);
+    assert(pp->mode == MODE_NONE && pp->fmc[FMC_NAND_STATUS / 4] == 0x40);
+    free(ps); free(pp);
     free(sp); free(bp); free(wsp); free(wp); free(isp); free(ip);
     puts("PASS: H2FMI transfer-start rule, O(1) FIFO reads in order, write waits for data + metadata, "
          "status after READ ID");

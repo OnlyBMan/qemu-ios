@@ -61,7 +61,7 @@ typedef struct DeviceState DeviceState;
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define le32_to_cpu(x) (x)
 #define qemu_log_mask(...) ((void)0)
-static int irq_level[0x26];   /* the test numbers each channel's line by its channel */
+static int irq_level[0x2d];   /* the test numbers each channel's line by its channel */
 static void qemu_set_irq(int irq, int v) { irq_level[irq] = v; }
 typedef struct S5L8930CDMAState S5L8930CDMAState;
 typedef int Error, GError;
@@ -74,10 +74,11 @@ typedef int QCryptoCipherAlgo;
 static void error_report_err(Error *e) { (void)e; }
 #define warn_report(...) ((void)0)
 static int qcrypto_cipher_get_key_len(int a) { (void)a; return 32; }
+static uint8_t last_cipher_key[32], last_cipher_iv[16];
 static QCryptoCipher *qcrypto_cipher_new(int a, int m, const uint8_t *k, size_t l, Error **e) {
-    (void)a; (void)m; (void)k; (void)l; (void)e; static int dummy; return (QCryptoCipher *)&dummy;
+    (void)a; (void)m; (void)e; memcpy(last_cipher_key, k, l); static int dummy; return (QCryptoCipher *)&dummy;
 }
-static int qcrypto_cipher_setiv(QCryptoCipher *c, const uint8_t *iv, size_t l, Error **e) { return 0; }
+static int qcrypto_cipher_setiv(QCryptoCipher *c, const uint8_t *iv, size_t l, Error **e) { memcpy(last_cipher_iv, iv, l); return 0; }
 /* Visible identity-ish transform: only ever reached under the mutation here. */
 static int qcrypto_cipher_encrypt(QCryptoCipher *c, const void *in, void *out, size_t len, Error **e) {
     for (size_t i = 0; i < len; i++) ((uint8_t *)out)[i] = ((const uint8_t *)in)[i] ^ 0xff; return 0;
@@ -142,8 +143,12 @@ static void setup_chan(S5L8930CDMAState *s, int ch, uint32_t settings, uint64_t 
 #define SRC    (S5L8930_DRAM_BASE + 0x400)
 #define DST    (S5L8930_DRAM_BASE + 0x800)
 static uint32_t big_avail(void *o, hwaddr a, bool td) { (void)o; (void)a; (void)td; return ~0u; }
+static uint32_t partial_avail(void *o, hwaddr a, bool td) { return 32; }
 int main(void) {
     S5L8930CDMAState *s = calloc(1, sizeof *s);
+    s->channels = S5L8930_CDMA_CHANNELS;
+    s->dram_base = S5L8930_DRAM_BASE;
+    s->dram_size = S5L8930_DRAM_SIZE;
 
     /* ---- +0x10/+0x14 report enabled channels, a status word ---- */
     CW(0x00, 0x5);                       /* enable channels 0 and 2 */
@@ -182,6 +187,9 @@ int main(void) {
 
     /* ---- FIFO-drained signal: a paced device FIFO waits for sink_done ---- */
     S5L8930CDMAState *s2 = calloc(1, sizeof *s2);
+    s2->channels = S5L8930_CDMA_CHANNELS;
+    s2->dram_base = S5L8930_DRAM_BASE;
+    s2->dram_size = S5L8930_DRAM_SIZE;
     s5l8930_cdma_set_source((DeviceState *)s2, FIFO_A, sizeof fifo_sink, big_avail, NULL);
     for (int i = 0; i < 64; i++) DRAM[SRC - S5L8930_DRAM_BASE + i] = 0x30 + i;
     fifo_sink_len = 0;
@@ -200,6 +208,9 @@ int main(void) {
 
     /* ---- memory-to-memory channels interrupt only with control bit 3 ---- */
     S5L8930CDMAState *s3 = calloc(1, sizeof *s3);
+    s3->channels = S5L8930_CDMA_CHANNELS;
+    s3->dram_base = S5L8930_DRAM_BASE;
+    s3->dram_size = S5L8930_DRAM_SIZE;
     for (int i = 0; i < CDMA_CHANNELS; i++) s3->irq[i] = i;
     cdma_write(s3, 0x00, 3u << 1, 4);                          /* channels 1 and 2 enabled */
     wr32(DESC + 0, 0);
@@ -226,6 +237,62 @@ int main(void) {
     cdma_write(s3, CHREG(2, CH_CTRL), 0x88 | CTRL_GO, 4);      /* iOS 7's drain */
     assert(irq_level[2] && !(s3->ch[2].ctrl & ST_ERROR));
     assert(memcmp(DRAM + (DST - S5L8930_DRAM_BASE), DRAM + (SRC - S5L8930_DRAM_BASE), 64) == 0);
+
+    /* A5's scrambled custom keys are unmasked by the global eight-word scrambler. */
+    s->inline_aes = true;
+    for (unsigned i = 0; i < 8; i++) s->aes[1].key[i] = 0x11223300 + i;
+    for (unsigned i = 0; i < 4; i++) {
+        s->aes[0].iv[i] = 0xaabbcc00 + i;
+        s->aes[0].key[i] = 0x55667700 + i;
+    }
+    s->aes[1].setup = AES_ENABLE | AES_KEY_CUSTOM | 2;
+    uint8_t block[16] = {0};
+    assert(aes_apply(s, &s->aes[1], block, sizeof(block), true));
+    for (unsigned i = 0; i < 8; i++) {
+        uint32_t expected = s->aes[1].key[i] ^ (i < 4 ? s->aes[0].iv[i] : s->aes[0].key[i - 4]);
+        assert(memcmp(last_cipher_key + 4*i, &expected, 4) == 0);
+    }
+    s->aes[1].setup &= ~2u;
+    assert(aes_apply(s, &s->aes[1], block, sizeof(block), true));
+    assert(memcmp(last_cipher_key, s->aes[1].key, 32) == 0);
+
+    /* A5's upper channel bank is absent on A4, then exposed by its board property. */
+    setup_chan(s, 44, SET_TO_DEVICE, FIFO_A, DESC);
+    assert(CR(CHREG(44, CH_SETTINGS)) == 0);
+    s->channels = 45;
+    s->inline_aes = true;
+    s->aes[1].setup = AES_ENABLE | AES_KEY_CUSTOM | AES_ENCRYPT | (44 << 8);
+    wr32(DESC, 0);
+    wr32(DESC + 4, DESC_DATA | DESC_LAST | DESC_AES | DESC_AES_RESTART);
+    wr32(DESC + 8, SRC);
+    wr32(DESC + 12, 64);
+    setup_chan(s, 44, SET_TO_DEVICE, FIFO_A, DESC);
+    fifo_sink_len = 0;
+    CW(CHREG(44, CH_CTRL), CTRL_GO);
+    assert(CR(CHREG(44, CH_CTRL)) & ST_DONE);
+    assert(fifo_sink_len == 64);
+    for (unsigned i = 0; i < 64; i++) assert(fifo_sink[i] == (uint8_t)(DRAM[SRC - S5L8930_DRAM_BASE + i] ^ 0xff));
+    memcpy(fifo_src, fifo_sink, 64);
+    fifo_src_pos = 0;
+    s->aes[1].setup &= ~AES_ENCRYPT;
+    wr32(DESC + 8, DST);
+    setup_chan(s, 44, 0, FIFO_A, DESC);
+    CW(CHREG(44, CH_CTRL), CTRL_GO);
+    assert(memcmp(DRAM + (DST - S5L8930_DRAM_BASE), DRAM + (SRC - S5L8930_DRAM_BASE), 64) == 0);
+
+    /* A paced FIFO may split a descriptor; its continuation retains the CBC chain. */
+    s5l8930_cdma_set_source((DeviceState *)s, FIFO_A, 4, partial_avail, NULL);
+    s->aes[1].setup |= AES_ENCRYPT;
+    wr32(DESC + 8, SRC);
+    setup_chan(s, 44, SET_TO_DEVICE, FIFO_A, DESC);
+    fifo_sink_len = 0;
+    CW(CHREG(44, CH_CTRL), CTRL_GO);
+    assert(s->ch[44].in_seg && fifo_sink_len == 32);
+    uint8_t continuation[16]; memcpy(continuation, s->aes[1].chain, 16);
+    assert(memcmp(continuation, s->aes[1].iv, 16) != 0);
+    s5l8930_cdma_kick((DeviceState *)s);
+    assert(!s->ch[44].in_seg && fifo_sink_len == 64);
+    assert(memcmp(last_cipher_iv, continuation, 16) == 0);
 
     free(s); free(s2); free(s3);
     puts("PASS: CDMA inline-AES bypass symmetric both ways, enabled-channel status regs, FIFO-drained signal, "

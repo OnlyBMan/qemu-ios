@@ -32,6 +32,7 @@ bool ipod_touch_nor_io_failed(void);
 bool s5l8930_iop_io_failed(void);
 bool ipod_touch_mipi_dsi_panel_off(void);
 bool s5l8930_d1815_guest_shutdown_confirmed(void);
+bool s5l8940_d1881_guest_shutdown_confirmed(void);
 
 #include "qemu-ios-ui.h"
 #include "virtual-input.h"
@@ -348,6 +349,9 @@ bool qemu_ios_ui_ready(void)
 
 bool qemu_ios_ui_guest_shutdown_confirmed(void)
 {
+    if (s5l8940_d1881_guest_shutdown_confirmed()) {
+        return true;
+    }
     return qatomic_read(&ios_is_ipad1) ? s5l8930_d1815_guest_shutdown_confirmed()
                                        : pcf50633_guest_shutdown_confirmed();
 }
@@ -397,6 +401,7 @@ void qemu_ios_ui_vm_started(void)
     qatomic_set(&ios_is_ipad1, object_dynamic_cast(qdev_get_machine(),
                                                    MACHINE_TYPE_NAME("ipad1")) != NULL);
     qatomic_set(&ios_dsi_panel, qatomic_read(&ios_is_ipad1) ||
+                object_dynamic_cast(qdev_get_machine(), MACHINE_TYPE_NAME("iPhone-4S")) != NULL ||
                 object_dynamic_cast(qdev_get_machine(), "s5l8920-machine") != NULL);
     for (i = 0; i < INPUT_EVENT_SLOTS_MAX; i++) {
         ios.slots[i].tracking_id = -1;
@@ -432,6 +437,7 @@ static const QemuIosDeviceInfo ios_devices[] = {
     { "ipad1",         "k48ap", 1024,  768, 1, 1, false, true,  true,  true,  A4_PANEL },
     { "iPod-Touch-4G", "n81ap",  640,  960, 2, 0, false, true,  false, false, A4_PANEL },
     { "iPhone-4",      "n90ap",  640,  960, 2, 0, true,  true,  true,  false, A4_PANEL },
+    { "iPhone-4S",     "n94ap",  640,  960, 2, 0, false, true,  false, false, 640, 640, 960, 16, 640 * 960 },
 };
 
 const QemuIosDeviceInfo *qemu_ios_device_info(const char *machine)
@@ -626,6 +632,7 @@ static void ios_press(IPodTouchButton button, bool down)
     /* Each is a no-op unless its machine is the one running. */
     ipod_touch_press_button(button, down);
     ipad1_press_button(button, down);
+    iphone4s_press_button(button, down);
     ipod_touch_1g_press_button(button, down);
     s5l8920_press_button(button, down);
 }

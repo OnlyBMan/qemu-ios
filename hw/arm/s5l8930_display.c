@@ -89,6 +89,7 @@ typedef struct {
 
 /* A UI layer's scanout: its buffer and where it lands on the panel. */
 typedef struct UILayer {
+    int layer;
     uint32_t fmt, base, stride;      /* stride: bytes from one source row to the next */
     unsigned sx, sy, sw, sh;         /* source rectangle */
     unsigned x0, y0, x1, y1;         /* destination rectangle, clipped to the panel */
@@ -103,6 +104,7 @@ struct S5L8930DisplayState {
     QEMUTimer *vbl;
     int64_t next_vbl;        /* the VBL's deadline, QEMU_CLOCK_VIRTUAL */
     uint64_t fb_base;        /* property: seed iBoot's scanout when nonzero */
+    bool a5;
     uint16_t width, height;  /* properties: the board's panel, as iBoot programs it */
     uint32_t pw, ph;         /* "panel-width"/"panel-height": panel= override (issue #21), 0 = the board's */
     uint32_t refresh_hz;     /* "refresh-hz": the VBL's rate, 60 as on the devices */
@@ -559,11 +561,29 @@ hwaddr s5l8930_dart2_xlate(void *display, uint32_t va, unsigned sid)
 }
 
 /* Read `len` bytes of framebuffer at IOVA `va`, page by page. */
-static void fb_read(S5L8930DisplayState *s, uint32_t va, uint8_t *dst, unsigned len)
+static void fb_read(S5L8930DisplayState *s, int layer, uint32_t va, uint8_t *dst, unsigned len)
 {
     while (len) {
         unsigned n = MIN(len, 0x1000 - (va & 0xfff));
-        hwaddr pa = dart_xlate(s, va);
+        hwaddr pa = s->a5 && layer >= 0 ? va : dart_xlate(s, va);
+        if (s->a5 && layer >= 0) {
+            uint32_t *ui = s->pipe[0].regs + DP_UI_BASE(layer) / 4;
+            if (ui[0x90 / 4] & 1) {
+                pa = (hwaddr)-1;
+                if (va < 0x4000000) {
+                    uint32_t table = ui[(0x98 + 4 * (va >> 22)) / 4];
+                    uint32_t entry = 0;
+                    if (table && address_space_read(&address_space_memory,
+                            (table & ~0xfffu) + 4 * ((va >> 12) & 0x3ff),
+                            MEMTXATTRS_UNSPECIFIED, &entry, sizeof(entry)) == MEMTX_OK) {
+                        entry = le32_to_cpu(entry);
+                        if (entry & 1) {
+                            pa = (entry & ~0xfffu) | (va & 0xfff);
+                        }
+                    }
+                }
+            }
+        }
 
         if (pa == (hwaddr)-1) {
             memset(dst, 0, n);
@@ -601,8 +621,9 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
                           UILayer *u)
 {
     uint32_t *r = s->pipe[0].regs, *ui = r + DP_UI_BASE(layer) / 4;
-    uint32_t org = ui[DP_UI_DST_ORIGIN / 4], end = ui[DP_UI_DST_END / 4];
-    uint32_t sorg = ui[DP_UI_SRC_ORIGIN / 4], send = ui[DP_UI_SRC_END / 4];
+    unsigned rect = s->a5 ? 0x10 : 0;
+    uint32_t org = ui[(DP_UI_DST_ORIGIN + rect) / 4], end = ui[(DP_UI_DST_END + rect) / 4];
+    uint32_t sorg = ui[(DP_UI_SRC_ORIGIN + rect) / 4], send = ui[(DP_UI_SRC_END + rect) / 4];
 
     /*
      * 3.2's AppleDisplayPipe (7B500 0xc058d4de) programs DST_ORIGIN and DST_END only for a layer placed off 0,0 and
@@ -611,13 +632,14 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
      * them, and honoring those drew the whole Home screen into the window (LightTouchMac issue 87). 4.x writes 0 to
      * UNSCALED and both corners on every swap (8C148 0x806cf468).
      */
-    if (ui[DP_UI_UNSCALED / 4] & 1) {
+    if (!s->a5 && (ui[DP_UI_UNSCALED / 4] & 1)) {
         org = end = 0;
     }
 
     if (!(r[DP_LAYERS / 4] & (0x100 << layer))) {
         return false;
     }
+    u->layer = layer;
     u->base = ui[DP_UI_ADDR / 4];
     u->fmt = (ui[DP_UI_FORMAT / 4] >> 8) & 7;
     /*
@@ -654,7 +676,7 @@ static bool scanout_layer(S5L8930DisplayState *s, int layer, unsigned w, unsigne
     if (!(ui[DP_UI_FORMAT / 4] & DP_UI_FORMAT_LINEAR)) {
         u->stride >>= 4;
     }
-    return u->base != 0;
+    return u->base != 0 || (s->a5 && (ui[0x90 / 4] & 1));
 }
 
 static size_t layer_row_bytes(const UILayer *u)
@@ -673,12 +695,12 @@ static size_t layer_fetch(S5L8930DisplayState *s, const UILayer *u, uint8_t *dst
     uint32_t base = u->base + u->sy * u->stride + u->sx * (u->fmt ? 2 : 4);
 
     if (u->sh == rows && u->stride == row) {
-        fb_read(s, base, dst, row * rows);
+        fb_read(s, u->layer, base, dst, row * rows);
         return row * rows;
     }
     for (unsigned y = u->y0; y < u->y1; y++) {
         unsigned sy = (unsigned)((uint64_t)(y - u->y0) * u->sh / rows);
-        fb_read(s, base + sy * u->stride, dst + (y - u->y0) * row, row);
+        fb_read(s, u->layer, base + sy * u->stride, dst + (y - u->y0) * row, row);
     }
     return row * rows;
 }
@@ -783,9 +805,9 @@ static bool video_compose(S5L8930DisplayState *s, unsigned w, unsigned h, uint32
     }
     g_autofree uint8_t *yp = g_malloc((size_t)sw * sh), *uvp = g_malloc((size_t)sw * sh / 2);
     for (unsigned y = 0; y < sh; y++) {
-        fb_read(s, r[0x307c / 4] + y * ys, yp + (size_t)y * sw, sw);
+        fb_read(s, -1, r[0x307c / 4] + y * ys, yp + (size_t)y * sw, sw);
         if (!(y & 1)) {
-            fb_read(s, r[0x3080 / 4] + y / 2 * uvs, uvp + (size_t)y / 2 * sw, sw);
+            fb_read(s, -1, r[0x3080 / 4] + y / 2 * uvs, uvp + (size_t)y / 2 * sw, sw);
         }
     }
     memset(out, 0, (size_t)w * h * 4);
@@ -1074,7 +1096,10 @@ static void s5l8930_display_reset(DeviceState *dev)
         r[(DP_UI_BASE(0) + DP_UI_STRIDE) / 4] = s->width * 4 | 2;
         /* ARGB and linear, as iBoot programs its framebuffer (iBoot-931 0x5ff01bfc: format << 8 | 1). */
         r[(DP_UI_BASE(0) + DP_UI_FORMAT) / 4] = DP_UI_FORMAT_LINEAR;
-        r[(DP_UI_BASE(0) + DP_UI_SRC_END) / 4] = s->width << 16 | s->height;
+        r[(DP_UI_BASE(0) + DP_UI_SRC_END + (s->a5 ? 0x10 : 0)) / 4] = s->width << 16 | s->height;
+        if (s->a5) {
+            r[(DP_UI_BASE(0) + 0x4c) / 4] = s->width << 16 | s->height;
+        }
     }
     pipes_update_irq(s);
     s->next_vbl = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VBL_PERIOD_NS(s);
@@ -1238,6 +1263,7 @@ static const VMStateDescription vmstate_s5l8930_display = {
 };
 
 static const Property s5l8930_display_properties[] = {
+    DEFINE_PROP_BOOL("a5", S5L8930DisplayState, a5, false),
     DEFINE_PROP_UINT64("fb-base", S5L8930DisplayState, fb_base, 0),
     DEFINE_PROP_UINT16("width", S5L8930DisplayState, width, 1024),     /* K48 */
     DEFINE_PROP_UINT16("height", S5L8930DisplayState, height, 768),

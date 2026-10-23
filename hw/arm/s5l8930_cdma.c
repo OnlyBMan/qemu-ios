@@ -62,7 +62,7 @@
 
 OBJECT_DECLARE_SIMPLE_TYPE(S5L8930CDMAState, S5L8930_CDMA)
 
-#define CDMA_CHANNELS       S5L8930_CDMA_CHANNELS
+#define CDMA_CHANNELS       0x2d
 #define CDMA_CHAN_SHIFT     12
 #define AES_CONTEXTS        9
 #define CDMA_FIFO_MAX       CDMA_MAX_SEGMENT    /* engine output not yet drained; a snapshot holds no more */
@@ -146,12 +146,15 @@ typedef struct CDMASource {
 
 struct S5L8930CDMAState {
     SysBusDevice parent_obj;
+    uint64_t dram_base;
     uint64_t dram_size;         /* property: device FIFO vs memory is by address */
     MemoryRegion cdma_mem;
     MemoryRegion aes_mem;
     qemu_irq irq[CDMA_CHANNELS];
 
     uint32_t enabled[2];
+    bool inline_aes;
+    uint8_t channels;
     uint8_t version;        /* DT cdma-version: 1 (S5L8920) has no channel-enable registers */
     uint32_t paced_base, paced_ports;
     CDMAChannel ch[CDMA_CHANNELS];
@@ -294,7 +297,11 @@ static bool aes_apply(S5L8930CDMAState *s, AESContext *c, uint8_t *buf,
 
     if (c->setup & AES_KEY_CUSTOM) {
         for (int i = 0; i < 8; i++) {
-            stl_le_p(keybuf + 4 * i, c->key[i]);
+            uint32_t word = c->key[i];
+            if (s->inline_aes && (c->setup & 2)) {
+                word ^= i < 4 ? s->aes[0].iv[i] : s->aes[0].key[i - 4];
+            }
+            stl_le_p(keybuf + 4 * i, word);
         }
         key = keybuf;
         algo = algos[AES_KEYLEN(c->setup)];     /* bounded: a 2-bit field, 4 entries */
@@ -446,8 +453,8 @@ static bool cdma_waits_for_uart(const CDMAChannel *c)
 
 static bool cdma_is_memory(S5L8930CDMAState *s, uint32_t addr)
 {
-    return addr >= S5L8930_DRAM_BASE &&
-           addr < S5L8930_DRAM_BASE + s->dram_size;
+    return addr >= s->dram_base &&
+           addr < s->dram_base + s->dram_size;
 }
 
 static void cdma_fifo_xfer(uint32_t fifo, uint32_t width, uint8_t *buf,
@@ -502,9 +509,15 @@ static void cdma_run(S5L8930CDMAState *s, int ch)
             break;                              /* empty slot: chain ends */
         }
         if ((flags & DESC_TYPE_MASK) == DESC_IV) {
-            /* A per-page IV for the NAND data key (iBoot reads, the IOP
-             * firmware's writes too; see DESC_IV). The store holds pages in
-             * the clear, so the IV is not applied. */
+            if (s->inline_aes) {
+                AESContext *filter = aes_for_channel(s, ch);
+                if (filter) {
+                    dma_memory_read(&address_space_memory, c->desc + 16,
+                                    filter->iv, 16, MEMTXATTRS_UNSPECIFIED);
+                    memcpy(filter->chain, filter->iv, 16);
+                    filter->carry_len = 0;
+                }
+            }
             c->desc = le32_to_cpu(d[0]);
             continue;
         }
@@ -531,9 +544,9 @@ static void cdma_run(S5L8930CDMAState *s, int ch)
             g_autofree uint8_t *buf = g_malloc(len);
             bool ok = true;
 
-            /* dev_fifo covers fed: a device-FIFO channel's context filters
-             * inline, both ways, and the store is in the clear (see above). */
-            bool crypt = (flags & DESC_AES) && !dev_fifo;
+            /* A4's translated store keeps NAND pages in the clear. A5's
+             * native PPN backend passes both directions through inline AES. */
+            bool crypt = (flags & DESC_AES) && (!dev_fifo || s->inline_aes);
 
             if (crypt) {
                 aes = aes ? aes : aes_for_channel(s, ch);
@@ -546,9 +559,9 @@ static void cdma_run(S5L8930CDMAState *s, int ch)
                 dma_memory_read(&address_space_memory, c->addr, buf, len,
                                 MEMTXATTRS_UNSPECIFIED);
                 if (feeds && (flags & DESC_AES)) {
-                    ok = aes_feed(s, aes, buf, len, flags & DESC_AES_RESTART);
+                    ok = aes_feed(s, aes, buf, len, !resume && (flags & DESC_AES_RESTART));
                 } else if (crypt) {
-                    ok = aes_apply(s, aes, buf, len, flags & DESC_AES_RESTART);
+                    ok = aes_apply(s, aes, buf, len, !resume && (flags & DESC_AES_RESTART));
                 }
                 if (feeds) {
                     if (!(flags & DESC_AES)) {
@@ -832,7 +845,7 @@ static uint64_t cdma_read(void *opaque, hwaddr offset, unsigned size)
         default:
             break;
         }
-    } else if (ch < CDMA_CHANNELS) {
+    } else if (ch < s->channels) {
         CDMAChannel *c = &s->ch[ch];
         if (cdma_is_paced(s, ch)) {
             cdma_paced_advance(s, ch, cdma_paced_pos(s, ch));
@@ -886,7 +899,7 @@ static void cdma_write(void *opaque, hwaddr offset, uint64_t value,
         }
         return;
     }
-    if (ch >= CDMA_CHANNELS) {
+    if (ch >= s->channels) {
         qemu_log_mask(LOG_UNIMP, "s5l8930.cdma: unimplemented write 0x%"
                       HWADDR_PRIx " = 0x%x\n", offset, v);
         return;
@@ -1035,6 +1048,7 @@ static void aes_write(void *opaque, hwaddr offset, uint64_t value,
     if (ctx < AES_CONTEXTS) {
         AESContext *c = &s->aes[ctx];
         if (reg == AES_SETUP) {
+            TRACE_PRINTF(trace_s5l8930_cdma_log, "[AES] ctx %d setup %x\n", ctx, v);
             /* Context 0 holds the sticky key-disable bits. */
             c->setup = ctx ? v : (c->setup | v);
             return;
@@ -1075,6 +1089,15 @@ static void s5l8930_cdma_reset(DeviceState *dev)
     s->fifo_len = 0;
     memset(s->paced, 0, sizeof(s->paced));
     memset(s->paced_end, 0, sizeof(s->paced_end));
+    memset(s->paced_start, 0, sizeof(s->paced_start));
+    memset(s->paced_desc, 0, sizeof(s->paced_desc));
+    memset(s->paced_sent, 0, sizeof(s->paced_sent));
+    memset(s->paced_bps, 0, sizeof(s->paced_bps));
+    memset(s->sink_pending, 0, sizeof(s->sink_pending));
+    memset(s->sink_early, 0, sizeof(s->sink_early));
+    memset(s->in_run, 0, sizeof(s->in_run));
+    memset(s->in_seg_mig, 0, sizeof(s->in_seg_mig));
+
     timer_del(s->pace_timer);
     for (int i = 0; i < CDMA_CHANNELS; i++) {
         qemu_set_irq(s->irq[i], 0);
@@ -1087,7 +1110,7 @@ static void s5l8930_cdma_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->cdma_mem, obj, &cdma_ops, s, "s5l8930.cdma",
-                          S5L8930_CDMA_SIZE);
+                          CDMA_CHANNELS << CDMA_CHAN_SHIFT);
     sysbus_init_mmio(sbd, &s->cdma_mem);
     memory_region_init_io(&s->aes_mem, obj, &aes_ops, s, "s5l8930.aes",
                           S5L8930_AES_SIZE);
@@ -1171,7 +1194,7 @@ static int cdma_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_s5l8930_cdma = {
     .name = "s5l8930.cdma",
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 1,
     .pre_save = cdma_pre_save,
     .pre_load = cdma_pre_load,
@@ -1181,25 +1204,40 @@ static const VMStateDescription vmstate_s5l8930_cdma = {
         VMSTATE_UINT32(fifo_len, S5L8930CDMAState),
         VMSTATE_VALIDATE("fifo_len", cdma_fifo_len_ok),
         VMSTATE_VBUFFER_ALLOC_UINT32(fifo, S5L8930CDMAState, 0, NULL, fifo_len),
-        VMSTATE_STRUCT_ARRAY(ch, S5L8930CDMAState, CDMA_CHANNELS, 1,
+        VMSTATE_STRUCT_SUB_ARRAY(ch, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 1,
                              vmstate_cdma_channel, CDMAChannel),
         VMSTATE_STRUCT_ARRAY(aes, S5L8930CDMAState, AES_CONTEXTS, 1,
                              vmstate_aes_context, AESContext),
-        VMSTATE_BOOL_ARRAY_V(paced, S5L8930CDMAState, CDMA_CHANNELS, 2),
-        VMSTATE_INT64_ARRAY_V(paced_start, S5L8930CDMAState,
-                              CDMA_CHANNELS, 2),
-        VMSTATE_INT64_ARRAY_V(paced_end, S5L8930CDMAState,
-                              CDMA_CHANNELS, 3),
-        VMSTATE_UINT32_ARRAY_V(paced_desc, S5L8930CDMAState,
-                               CDMA_CHANNELS, 2),
-        VMSTATE_UINT64_ARRAY_V(paced_sent, S5L8930CDMAState,
-                               CDMA_CHANNELS, 2),
-        VMSTATE_UINT32_ARRAY_V(paced_bps, S5L8930CDMAState,
-                               CDMA_CHANNELS, 2),
+        VMSTATE_SUB_ARRAY(paced, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 2, vmstate_info_bool, bool),
+        VMSTATE_SUB_ARRAY(paced_start, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 2, vmstate_info_int64, int64_t),
+        VMSTATE_SUB_ARRAY(paced_end, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 3, vmstate_info_int64, int64_t),
+        VMSTATE_SUB_ARRAY(paced_desc, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 2, vmstate_info_uint32, uint32_t),
+        VMSTATE_SUB_ARRAY(paced_sent, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 2, vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(paced_bps, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 2, vmstate_info_uint32, uint32_t),
         VMSTATE_TIMER_PTR_V(pace_timer, S5L8930CDMAState, 2),
         /* 4: the IOP core's chains, mid-transfer between its instructions */
-        VMSTATE_BOOL_ARRAY_V(sink_pending, S5L8930CDMAState, CDMA_CHANNELS, 4),
-        VMSTATE_BOOL_ARRAY_V(in_seg_mig, S5L8930CDMAState, CDMA_CHANNELS, 4),
+        VMSTATE_SUB_ARRAY(sink_pending, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 4, vmstate_info_bool, bool),
+        VMSTATE_SUB_ARRAY(in_seg_mig, S5L8930CDMAState, 0, S5L8930_CDMA_CHANNELS, 4, vmstate_info_bool, bool),
+        /* A5 adds channels 38 through 44; retain the older stream's prefix. */
+        VMSTATE_STRUCT_SUB_ARRAY(ch, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                                 CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5,
+                                 vmstate_cdma_channel, CDMAChannel),
+        VMSTATE_SUB_ARRAY(paced, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_bool, bool),
+        VMSTATE_SUB_ARRAY(paced_start, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_int64, int64_t),
+        VMSTATE_SUB_ARRAY(paced_end, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_int64, int64_t),
+        VMSTATE_SUB_ARRAY(paced_desc, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_uint32, uint32_t),
+        VMSTATE_SUB_ARRAY(paced_sent, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(paced_bps, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_uint32, uint32_t),
+        VMSTATE_SUB_ARRAY(sink_pending, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_bool, bool),
+        VMSTATE_SUB_ARRAY(in_seg_mig, S5L8930CDMAState, S5L8930_CDMA_CHANNELS,
+                          CDMA_CHANNELS - S5L8930_CDMA_CHANNELS, 5, vmstate_info_bool, bool),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1209,6 +1247,10 @@ static void s5l8930_cdma_realize(DeviceState *dev, Error **errp)
     S5L8930CDMAState *s = S5L8930_CDMA(dev);
     g_autoptr(GError) error = NULL;
 
+    if (s->channels < S5L8930_CDMA_CHANNELS || s->channels > CDMA_CHANNELS) {
+        error_setg(errp, "channels: expected 38 through 45");
+        return;
+    }
     if (!s->gid_path) {
         return;
     }
@@ -1233,7 +1275,10 @@ static void s5l8930_cdma_finalize(Object *obj)
 
 static const Property s5l8930_cdma_properties[] = {
     DEFINE_PROP_STRING("gid-blobs", S5L8930CDMAState, gid_path),
+    DEFINE_PROP_UINT64("dram-base", S5L8930CDMAState, dram_base, S5L8930_DRAM_BASE),
     DEFINE_PROP_UINT64("dram-size", S5L8930CDMAState, dram_size, S5L8930_DRAM_SIZE),   /* the board's */
+    DEFINE_PROP_BOOL("inline-aes", S5L8930CDMAState, inline_aes, false),
+    DEFINE_PROP_UINT8("channels", S5L8930CDMAState, channels, S5L8930_CDMA_CHANNELS),
     DEFINE_PROP_UINT8("version", S5L8930CDMAState, version, 2),
     DEFINE_PROP_UINT32("paced-base", S5L8930CDMAState, paced_base, S5L8930_I2S_BASE(0)),
     DEFINE_PROP_UINT32("paced-ports", S5L8930CDMAState, paced_ports, 3),

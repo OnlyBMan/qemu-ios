@@ -200,7 +200,9 @@ struct S5L8930IOPState {
     MemoryRegion vic_mr;
 
     DeviceState *sdio;      /* ring 3 goes here; NULL = no card */
-    uint32_t nand_id;       /* the 4 ID bytes the kext compares, LE packed */
+    uint32_t nand_id;
+    uint32_t nand_meta_bytes;
+    uint32_t nand_extra_pages;      /* separately addressed PPN boot aperture */
     uint8_t nand_ce_mask;   /* CE slots populated on each bus */
     char *nand_dir;         /* page store directory; NULL = blank chip */
     char *overlay_dir;      /* copy-on-write overlay; base is then read-only */
@@ -463,14 +465,14 @@ static uint32_t nand_program_page(S5L8930IOPState *s, int bus, uint32_t ce,
             p[i] |= data[i] ^ 0xff;
         }
         if (meta) {
-            for (uint32_t i = 0; i < FMI_META_BYTES; i++) {
+            for (uint32_t i = 0; i < s->nand_meta_bytes; i++) {
                 p[s->store_page_bytes + i] |= meta[i] ^ 0xff;
             }
         }
     } else {
         memcpy(p, data, MIN(len, s->page_stride));
         if (meta) {
-            memcpy(p + s->store_page_bytes, meta, FMI_META_BYTES);
+            memcpy(p + s->store_page_bytes, meta, s->nand_meta_bytes);
         }
     }
     result = nand_io_error(blk_pwrite(blk, (int64_t)page * s->page_stride,
@@ -1570,11 +1572,11 @@ static void s5l8930_iop_realize(DeviceState *dev, Error **errp)
         return;
     }
     /* The store defines the page geometry; the chip population must match the model. */
-    if (page_bytes <= 0 || spare_bytes < FMI_META_BYTES ||
+    if (page_bytes <= 0 || spare_bytes < s->nand_meta_bytes ||
         page_bytes > FMI_MAX_PAGE || spare_bytes > FMI_MAX_PAGE - page_bytes ||
         ppb <= 0 || blocks <= 0 || ppb > UINT32_MAX ||
-        blocks > UINT32_MAX / ppb ||
-        (uint64_t)(blocks * ppb) > SIZE_MAX / (page_bytes + spare_bytes) ||
+        blocks > (UINT32_MAX - s->nand_extra_pages) / ppb ||
+        (uint64_t)(blocks * ppb + s->nand_extra_pages) > SIZE_MAX / (page_bytes + spare_bytes) ||
         buses != NAND_BUSES || ce_per_bus != ctpop8(s->nand_ce_mask) ||
         !id || g_ascii_strtoull(id, &id_end, 16) != s->nand_id || *id_end) {
         error_setg(errp, "%s does not match the IOP model (%d buses x %d CE, "
@@ -1592,7 +1594,7 @@ static void s5l8930_iop_realize(DeviceState *dev, Error **errp)
     s->page_stride = page_bytes + spare_bytes;
     s->store_page_bytes = page_bytes;
     s->store_ppb = ppb;
-    s->pages_per_ce = blocks * ppb;
+    s->pages_per_ce = blocks * ppb + s->nand_extra_pages;
     size = (size_t)s->pages_per_ce * s->page_stride;
 
     if (s->overlay_dir) {
@@ -1761,6 +1763,8 @@ static const VMStateDescription vmstate_s5l8930_iop = {
  * device-readid) must describe the same part.
  */
 static const Property s5l8930_iop_properties[] = {
+    DEFINE_PROP_UINT32("nand-meta-bytes", S5L8930IOPState, nand_meta_bytes, FMI_META_BYTES),
+    DEFINE_PROP_UINT32("nand-extra-pages", S5L8930IOPState, nand_extra_pages, 0),
     DEFINE_PROP_UINT32("nand-id", S5L8930IOPState, nand_id, 0xb614d5ad),
     DEFINE_PROP_UINT8("nand-ce-mask", S5L8930IOPState, nand_ce_mask, 0xf),
     DEFINE_PROP_STRING("nand", S5L8930IOPState, nand_dir),
